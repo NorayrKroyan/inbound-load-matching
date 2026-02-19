@@ -286,22 +286,4 @@ Row is eligible if:
 - Journey includes:
   - `join_id`
 
----
 
-## Notes / Improvements
-
-- Current matching uses DB lookups and fuzzy name logic. With ~3000 rows per table this is OK, but can be optimized further by:
-  - caching lookup maps (contacts/drivers/vehicles) in memory per request
-  - reducing per-row queries (bulk preload)
-  - adding indexes:
-    - `load_detail(input_method, input_id)`
-    - `vehicle(vehicle_number)`, `vehicle(vehicle_name)`
-    - `contact(first_name, last_name)` (or persisted normalized column)
-    - `join(id_pull_point, id_pad_location, is_deleted)`
-- If you want `filename only` for tickets/BOL, change extraction to return `basename($path)`.
-
----
-
-## License
-
-Private/internal tool. Add a license if you plan to open-source.
