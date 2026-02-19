@@ -1,0 +1,191 @@
+.page {
+    padding: 16px;
+    max-width: 1600px;
+    margin: 0 auto;
+    font-family: Arial, sans-serif;
+}
+
+.topbar {
+    display:flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: flex-start;
+    margin-bottom: 12px;
+}
+
+.h2 { margin: 0; }
+
+.sub {
+    font-size: 12px;
+    color: #666;
+    margin-top: 4px;
+}
+
+.controls {
+    display:flex;
+    flex-direction: column;
+    gap: 10px;
+    align-items: stretch;
+    min-width: 560px;
+}
+
+.input {
+    padding: 10px 12px;
+    border: 1px solid #ccc;
+    border-radius: 10px;
+    width: 100%;
+}
+
+.btn {
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid #222;
+    background:#111;
+    color:#fff;
+    cursor:pointer;
+    width: 100%;
+}
+
+.btn:disabled {
+    opacity: .6;
+    cursor: not-allowed;
+}
+
+.btnBulk {
+    background:#0f172a;
+    border-color:#0f172a;
+}
+
+.btnBulk:disabled {
+    opacity: .6;
+    cursor: not-allowed;
+}
+
+.bulkMsg {
+    font-size: 12px;
+    color: #334155;
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+.btn2 {
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid #bbb;
+    background:#fff;
+    cursor:pointer;
+}
+
+.btn2:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+}
+
+.card {
+    border: 1px solid #ddd;
+    border-radius: 10px;
+    background:#fff;
+    overflow: auto;
+}
+
+.table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.table th,
+.table td {
+    border-bottom: 1px solid #eee;
+    padding: 10px;
+    vertical-align: top;
+}
+
+.table th {
+    position: sticky;
+    top: 0;
+    background: #fafafa;
+    z-index: 2;
+    text-align:left;
+}
+
+.thChk,
+.tdChk {
+    width: 34px;
+    padding-left: 12px;
+    padding-right: 6px;
+}
+
+.tdChk {
+    vertical-align: middle;
+}
+
+.mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.small {
+    font-size: 12px;
+}
+
+.warn {
+    color: #9a4a00;
+    margin-top: 4px;
+    white-space: pre-wrap;
+}
+
+.err {
+    margin: 10px 0;
+    padding: 10px;
+    border: 1px solid #f2b8b5;
+    background: #fff5f5;
+    border-radius: 8px;
+    color: #8a1f17;
+    white-space: pre-wrap;
+}
+
+.empty {
+    text-align:center;
+    color:#666;
+    padding: 18px;
+}
+
+.pill {
+    display:inline-block;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    border: 1px solid transparent;
+}
+
+.pill-green {
+    background: #e8fff1;
+    color:#0f6a2f;
+    border-color:#8be2ac;
+}
+
+.pill-yellow {
+    background: #fff8e1;
+    color:#7a5a00;
+    border-color:#f0d37a;
+}
+
+.pill-red {
+    background: #ffecec;
+    color:#8a1f17;
+    border-color:#f2b8b5;
+}
+
+.pill-gray {
+    background: #f1f1f1;
+    color:#444;
+    border-color:#ddd;
+    margin-left: 6px;
+}
+
+.mt6 {
+    margin-top: 6px;
+}
