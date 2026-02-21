@@ -4,7 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
-use App\Services\InboundLoadMatchingService;
+use App\Services\InboundLoadMatching\InboundLoadMatchingService;
 
 class InboundLoadMatchingController extends Controller
 {
@@ -13,8 +13,8 @@ class InboundLoadMatchingController extends Controller
         $limit = (int)($request->query('limit', 200));
         $limit = max(1, min($limit, 500));
 
-        $only = strtolower((string)$request->query('only', 'unprocessed')); // unprocessed|processed|all
-        $q = (string)$request->query('q', '');
+        $only  = strtolower((string)$request->query('only', 'unprocessed')); // unprocessed|processed|all
+        $q     = (string)$request->query('q', '');
         $match = strtoupper((string)$request->query('match', '')); // GREEN|YELLOW|RED
 
         $rows = $svc->buildQueue($limit, $only, $q, $match);
@@ -26,6 +26,11 @@ class InboundLoadMatchingController extends Controller
         ]);
     }
 
+    /**
+     * STRICT single processing:
+     * - processes ONLY this import_id
+     * - refuses invalid transitions (no auto AT_TERMINAL)
+     */
     public function process(Request $request, InboundLoadMatchingService $svc)
     {
         $importId = (int)($request->input('import_id') ?? 0);
@@ -33,16 +38,19 @@ class InboundLoadMatchingController extends Controller
             return response()->json(['ok' => false, 'error' => 'import_id is required'], 422);
         }
 
-        $res = $svc->processImport($importId);
+        // ✅ IMPORTANT: call STRICT method (must exist in service)
+        $res = $svc->processImportStrict($importId);
 
-        $status = ($res['ok'] ?? false) ? 200 : 422;
-        return response()->json($res, $status);
+        return response()->json($res, ($res['ok'] ?? false) ? 200 : 422);
     }
 
     /**
-     * ✅ NEW: process many imports in one call
+     * STRICT batch:
+     * - processes ONLY selected import_ids
+     * - enforces forward-only transitions per (join_id + load_number)
+     * - returns per-item results (HTTP 200 so UI can show partial failures)
+     *
      * Body: { "import_ids": [123,124,125] }
-     * Returns per-id results and counts.
      */
     public function processBatch(Request $request, InboundLoadMatchingService $svc)
     {
@@ -59,65 +67,16 @@ class InboundLoadMatchingController extends Controller
             if ($id > 0) $clean[] = $id;
         }
         $clean = array_values(array_unique($clean));
+        $clean = array_slice($clean, 0, 500);
 
         if (count($clean) === 0) {
             return response()->json(['ok' => false, 'error' => 'No valid import_ids provided'], 422);
         }
 
-        // safety cap
-        $clean = array_slice($clean, 0, 500);
+        // ✅ IMPORTANT: call STRICT method (must exist in service)
+        $res = $svc->processBatchStrict($clean);
 
-        $results = [];
-        $okCount = 0;
-        $failCount = 0;
-        $alreadyCount = 0;
-
-        foreach ($clean as $id) {
-            try {
-                $res = $svc->processImport($id);
-
-                $results[] = [
-                    'import_id' => $id,
-                    'ok' => (bool)($res['ok'] ?? false),
-                    'already_processed' => (bool)($res['already_processed'] ?? false),
-                    'id_load' => $res['id_load'] ?? null,
-                    'id_load_detail' => $res['id_load_detail'] ?? null,
-                    'bol_path' => $res['bol_path'] ?? null,
-                    'bol_type' => $res['bol_type'] ?? null,
-                    'error' => $res['ok'] ? null : ($res['error'] ?? 'Unknown error'),
-                    'raw' => $res, // keep full for debugging
-                ];
-
-                if (($res['ok'] ?? false) === true) {
-                    $okCount++;
-                    if (($res['already_processed'] ?? false) === true) $alreadyCount++;
-                } else {
-                    $failCount++;
-                }
-            } catch (\Throwable $e) {
-                $failCount++;
-                $results[] = [
-                    'import_id' => $id,
-                    'ok' => false,
-                    'already_processed' => false,
-                    'id_load' => null,
-                    'id_load_detail' => null,
-                    'bol_path' => null,
-                    'bol_type' => null,
-                    'error' => $e->getMessage(),
-                    'raw' => null,
-                ];
-            }
-        }
-
-        return response()->json([
-            'ok' => true,
-            'requested' => count($ids),
-            'processed' => count($clean),
-            'ok_count' => $okCount,
-            'fail_count' => $failCount,
-            'already_processed_count' => $alreadyCount,
-            'results' => $results,
-        ]);
+        // Always 200 so frontend can display per-row errors in response.results
+        return response()->json($res, 200);
     }
 }

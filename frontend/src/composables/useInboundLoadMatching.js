@@ -1,8 +1,9 @@
 import { ref, computed } from 'vue'
+// ✅ Preferred (per doc): move your api helper to resources/js/api/http and import from there.
+// import { fetchJson } from '@/api/http'
 import { fetchJson } from '../utils/api'
 
 export function useInboundLoadMatching() {
-
     const rows = ref([])
     const loading = ref(false)
     const err = ref('')
@@ -22,12 +23,6 @@ export function useInboundLoadMatching() {
     const bulkDone = ref(0)
     const bulkMsg = ref('')
 
-    function pillClass(c) {
-        if (c === 'GREEN') return 'pill-green'
-        if (c === 'YELLOW') return 'pill-yellow'
-        return 'pill-red'
-    }
-
     function canProcess(r) {
         if (!r) return false
         if (r.is_inserted || r.is_processed) return false
@@ -40,11 +35,13 @@ export function useInboundLoadMatching() {
         const hasCarrier = !!resolved?.id_carrier
         const hasJoin = !!r?.match?.journey?.join_id
 
-        return conf === 'GREEN'
-            && journeyStatus === 'READY'
-            && hasDriver
-            && hasCarrier
-            && hasJoin
+        return (
+            conf === 'GREEN' &&
+            journeyStatus === 'READY' &&
+            hasDriver &&
+            hasCarrier &&
+            hasJoin
+        )
     }
 
     function isSelectable(r) {
@@ -83,9 +80,10 @@ export function useInboundLoadMatching() {
         return total > 0 && eligibleSelectedCount.value === total
     })
 
-    const someEligibleSelected = computed(() =>
-        eligibleSelectedCount.value > 0 &&
-        eligibleSelectedCount.value < eligibleIds.value.length
+    const someEligibleSelected = computed(
+        () =>
+            eligibleSelectedCount.value > 0 &&
+            eligibleSelectedCount.value < eligibleIds.value.length
     )
 
     function toggleSelectAllEligible(evt) {
@@ -116,14 +114,13 @@ export function useInboundLoadMatching() {
             const res = await fetchJson(`/api/inbound-loads/queue?${params.toString()}`)
             rows.value = res?.rows || []
 
-            // clean selection
+            // clean selection: keep only still-eligible IDs
             const allowed = new Set(eligibleIds.value)
             const next = new Set()
             for (const id of selected.value) {
                 if (allowed.has(id)) next.add(id)
             }
             selected.value = next
-
         } catch (e) {
             err.value = e?.message || String(e)
             rows.value = []
@@ -140,16 +137,13 @@ export function useInboundLoadMatching() {
         processingId.value = r.import_id
 
         try {
-            const resp = await fetch('/api/inbound-loads/process', {
+            const res = await fetchJson('/api/inbound-loads/process', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ import_id: r.import_id }),
+                data: { import_id: r.import_id }, // ✅ data (Axios), not body
             })
 
-            const res = await resp.json().catch(() => ({}))
-
-            if (!resp.ok || !res?.ok) {
-                throw new Error(res?.error || `Process failed (HTTP ${resp.status})`)
+            if (!res?.ok) {
+                throw new Error(res?.error || 'Process failed')
             }
 
             await load()
@@ -170,29 +164,36 @@ export function useInboundLoadMatching() {
         bulkDone.value = 0
 
         try {
-            const resp = await fetch('/api/inbound-loads/process-batch', {
+            const res = await fetchJson('/api/inbound-loads/process-batch', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ import_ids: ids }),
+                data: { import_ids: ids }, // ✅ data (Axios), not body
             })
 
-            const res = await resp.json().catch(() => ({}))
-
-            if (!resp.ok || !res?.ok) {
-                throw new Error(res?.error || `Batch failed (HTTP ${resp.status})`)
+            if (!res?.ok) {
+                throw new Error(res?.error || 'Batch failed')
             }
 
-            bulkMsg.value =
-                `Done. OK=${res.ok_count}, Failed=${res.fail_count}, Already=${res.already_processed_count}`
+            bulkMsg.value = `Done. OK=${res.ok_count}, Failed=${res.fail_count}, Already=${res.already_processed_count}`
 
             selected.value = new Set()
             await load()
-
         } catch (e) {
             err.value = e?.message || String(e)
         } finally {
             bulkProcessing.value = false
         }
+    }
+
+    function confidenceClasses(c) {
+        if (c === 'GREEN') return 'border-emerald-200 bg-emerald-50 text-emerald-800'
+        if (c === 'YELLOW') return 'border-amber-200 bg-amber-50 text-amber-800'
+        return 'border-red-200 bg-red-50 text-red-800'
+    }
+
+    function journeyClasses(status) {
+        if (status === 'READY') return 'border-emerald-200 bg-emerald-50 text-emerald-800'
+        if (status === 'PARTIAL') return 'border-amber-200 bg-amber-50 text-amber-800'
+        return 'border-red-200 bg-red-50 text-red-800'
     }
 
     return {
@@ -203,24 +204,31 @@ export function useInboundLoadMatching() {
         match,
         only,
         processingId,
+
+        // selection / bulk
         selected,
         bulkProcessing,
         bulkTotal,
         bulkDone,
         bulkMsg,
-        pillClass,
-        canProcess,
-        isSelectable,
-        isSelected,
-        toggleRow,
         eligibleIds,
         selectedCount,
         eligibleSelectedCount,
         allEligibleSelected,
         someEligibleSelected,
+
+        // behavior
+        canProcess,
+        isSelectable,
+        isSelected,
+        toggleRow,
         toggleSelectAllEligible,
         load,
         processRow,
         processSelected,
+
+        // UI class helpers
+        journeyClasses,
+        confidenceClasses,
     }
 }
