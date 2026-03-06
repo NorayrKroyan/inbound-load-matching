@@ -905,53 +905,30 @@ class InboundLoadMatchingService
     }
 
     /**
-     * Rules:
-     * - keep original import bol_path / bol_type in load_detail
-     * - IMAGE_IMPORT_GRABBER only copies the file locally
-     * - command receives 2 args: source path and local destination path
+     * Client test behavior:
+     * - IMAGE_IMPORT_GRABBER is a fixed command-line script/value from .env
+     * - execute it exactly as-is
+     * - do not append source/destination args during the test setup
+     * - keep source path handling in existing BOL update flow
      */
     private function applyDeliveredConfirmedImageImport(
         int $importId,
         array $bol
     ): array {
         $sourceBolPath = $this->str->strOrNull($bol['bol_path'] ?? null);
-        if (!$sourceBolPath) {
-            return [
-                'ok' => true,
-                'skipped' => true,
-                'reason' => 'No bol_path on import row.',
-            ];
-        }
 
-        $commandBase = $this->getImageImportGrabberCommand();
-        if (!$commandBase) {
+        $command = $this->getImageImportGrabberCommand();
+        if (!$command) {
             return [
                 'ok' => false,
                 'skipped' => false,
                 'error' => 'IMAGE_IMPORT_GRABBER is not configured.',
+                'source_path' => $sourceBolPath,
             ];
         }
-
-        $localDir = storage_path('app/loadimports/' . date('Y-m-d'));
-        if (!is_dir($localDir) && !@mkdir($localDir, 0775, true) && !is_dir($localDir)) {
-            return [
-                'ok' => false,
-                'skipped' => false,
-                'error' => "Failed to create local import directory: {$localDir}",
-            ];
-        }
-
-        $baseName = basename(str_replace('\\', '/', $sourceBolPath));
-        if (!$baseName || $baseName === '.' || $baseName === '..') {
-            $ext = strtolower((string)pathinfo($sourceBolPath, PATHINFO_EXTENSION));
-            $baseName = 'import_' . $importId . ($ext ? '.' . $ext : '');
-        }
-
-        $localPath = $localDir . DIRECTORY_SEPARATOR . $importId . '_' . $baseName;
-
-        $command = rtrim($commandBase) . ' ' . escapeshellarg($sourceBolPath) . ' ' . escapeshellarg($localPath);
 
         $exec = $this->executeShellCommand($command);
+
         if (!($exec['ok'] ?? false)) {
             return [
                 'ok' => false,
@@ -961,19 +938,6 @@ class InboundLoadMatchingService
                 'output' => $exec['output'] ?? [],
                 'exit_code' => $exec['exit_code'] ?? null,
                 'source_path' => $sourceBolPath,
-                'local_path' => $localPath,
-            ];
-        }
-
-        if (!file_exists($localPath)) {
-            return [
-                'ok' => false,
-                'skipped' => false,
-                'error' => "IMAGE_IMPORT_GRABBER succeeded but local file does not exist at: {$localPath}",
-                'command' => $command,
-                'output' => $exec['output'] ?? [],
-                'source_path' => $sourceBolPath,
-                'local_path' => $localPath,
             ];
         }
 
@@ -982,7 +946,7 @@ class InboundLoadMatchingService
             'skipped' => false,
             'command' => $command,
             'source_path' => $sourceBolPath,
-            'local_path' => $localPath,
+            'output' => $exec['output'] ?? [],
             'bol_type' => $this->str->strOrNull($bol['bol_type'] ?? null),
         ];
     }
