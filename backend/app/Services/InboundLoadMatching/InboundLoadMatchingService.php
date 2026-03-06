@@ -42,7 +42,6 @@ class InboundLoadMatchingService
         $this->tracker = new LoadimportsTracker($this->schema);
         $this->stageGuard = new LoadStageGuard($this->schema, $this->str, $this->stageResolver);
 
-        // IMPORTANT: LoadUpdater supports marking old loadimports as *_REPLACED.*
         $this->updater = new LoadUpdater($this->schema, $this->boxesBuilder, $this->bolExtractor);
     }
 
@@ -64,13 +63,10 @@ class InboundLoadMatchingService
     private LoadStageGuard $stageGuard;
     private LoadUpdater $updater;
 
-    // ------------------ PUBLIC: queue ------------------
-
     public function buildQueue(int $limit, string $only, string $q, string $matchFilter): array
     {
         $select = ['id', 'jobname', 'payload_json', 'payload_original', 'created_at', 'updated_at'];
 
-        // IMPORTANT: your DB may not have these columns, so we only include them if they exist
         foreach (['carrier', 'truck', 'terminal', 'state', 'delivery_time', 'load_number', 'ticket_number'] as $col) {
             if ($this->schema->columnExists('loadimports', $col)) $select[] = $col;
         }
@@ -199,10 +195,6 @@ class InboundLoadMatchingService
         return $out;
     }
 
-    // ============================================================
-    // STRICT SINGLE PROCESSING (NEXT-STAGE ONLY)
-    // ============================================================
-
     public function processImportStrict(int $importId): array
     {
         $row = DB::connection()->table('loadimports')->where('id', $importId)->first();
@@ -227,8 +219,15 @@ class InboundLoadMatchingService
 
         $currentRank = $this->stageGuard->inferCurrentStageRankFromDb($joinId, $loadNumber);
 
+        $liIsInserted = property_exists($row, 'is_inserted') ? (int)($row->is_inserted ?? 0) : 0;
+
+        $allowDeliveredConfirmedBootstrap =
+            $currentRank === 0
+            && $detectedStage === StageResolver::STAGE_DELIVERED_CONFIRMED
+            && $liIsInserted === 0;
+
         if ($currentRank === 0) {
-            if ($desiredRank !== 1) {
+            if (!$allowDeliveredConfirmedBootstrap && $desiredRank !== 1) {
                 return [
                     'ok' => false,
                     'stage' => $detectedStage,
@@ -262,10 +261,6 @@ class InboundLoadMatchingService
 
         return $this->processImport($importId, $detectedStage);
     }
-
-    // ============================================================
-    // Non-strict processing (but follows doc write-rules)
-    // ============================================================
 
     public function processImport(int $importId, ?string $forceStage = null): array
     {
@@ -304,7 +299,6 @@ class InboundLoadMatchingService
 
         $stage = $forceStage ?: $this->stageResolver->determineStage($row->payload_json ?? null, $parsed['state'] ?? null);
 
-        // ✅ FIX: delivery datetime must prefer payload datetime_delivered/datetime_at_destination for delivered stages
         $deliveryMysql = $this->resolveDeliveryMysqlForStage($stage, $row->payload_json ?? null, $parsed['delivery_time'] ?? null);
 
         $existing = DB::connection()
@@ -341,7 +335,181 @@ class InboundLoadMatchingService
             $deliveryMysql,
             $row
         ) {
-            // STAGE 1: AT_TERMINAL
+            $isInserted = property_exists($row, 'is_inserted') ? (int)($row->is_inserted ?? 0) : 0;
+
+            if ($stage === StageResolver::STAGE_DELIVERED_CONFIRMED && $isInserted === 0) {
+                $existingLoad = DB::connection()
+                    ->table('load_detail as ld')
+                    ->join('load as l', 'l.id_load', '=', 'ld.id_load')
+                    ->select(['ld.id_load_detail', 'ld.id_load'])
+                    ->where('ld.load_number', $parsed['load_number'])
+                    ->where('l.id_join', $joinId)
+                    ->where('l.is_deleted', 0)
+                    ->orderByDesc('ld.id_load_detail')
+                    ->first();
+
+                if ($existingLoad) {
+                    $idLoad = (int)$existingLoad->id_load;
+                    $idLoadDetail = (int)$existingLoad->id_load_detail;
+
+                    $detailUpd = [];
+                    $loadUpd = [];
+
+                    $this->updater->applyBoxesNoteIfMissing($idLoadDetail, $detailUpd, $boxesNote);
+
+                    if ($this->schema->columnExists('load_detail', 'ticket_number') && ($parsed['ticket_number'] ?? null)) {
+                        $detailUpd['ticket_number'] = $parsed['ticket_number'];
+                    }
+
+                    $this->updater->applyWeightsUpdates($detailUpd, $netLbs, $tons);
+
+                    $this->updater->applyDeliveryUpdates($loadUpd, $deliveryMysql, true);
+
+                    $this->updater->applyBolUpdateIfAllowed(
+                        $importId,
+                        $parsed,
+                        $idLoadDetail,
+                        $detailUpd,
+                        $bol,
+                        true
+                    );
+
+                    $imageImport = $this->applyDeliveredConfirmedImageImport($importId, $bol);
+
+                    if (!($imageImport['ok'] ?? false)) {
+                        return [
+                            'ok' => false,
+                            'stage' => $stage,
+                            'error' => $imageImport['error'] ?? 'IMAGE_IMPORT_GRABBER failed.',
+                            'image_import' => $imageImport,
+                        ];
+                    }
+
+                    $reviewMysql = $this->extractReviewDate($row->payload_json ?? null);
+                    if ($reviewMysql && $this->schema->columnExists('load_detail', 'review_date')) {
+                        $detailUpd['review_date'] = $reviewMysql;
+                    }
+
+                    $this->updater->flushUpdates($idLoad, $idLoadDetail, $loadUpd, $detailUpd);
+
+                    $this->tracker->updateTracking($importId, $idLoad, $idLoadDetail);
+
+                    $this->syncDeliveredConfirmedChainTracking(
+                        $importId,
+                        $parsed,
+                        $joinId,
+                        $idLoad,
+                        $idLoadDetail
+                    );
+
+                    return [
+                        'ok' => true,
+                        'stage' => $stage,
+                        'attached_to_existing' => true,
+                        'id_load' => $idLoad,
+                        'id_load_detail' => $idLoadDetail,
+                        'updated' => [
+                            'load' => array_keys($loadUpd),
+                            'load_detail' => array_keys($detailUpd),
+                        ],
+                        'image_import' => $imageImport,
+                    ];
+                }
+
+                $loadInsert = [
+                    'id_carrier' => $idCarrier,
+                    'id_join' => $joinId,
+                    'id_contact' => $idContact,
+                    'id_vehicle' => $idVehicle,
+                    'is_deleted' => 0,
+                    'load_date' => $loadDate,
+                    'is_finished' => null,
+                ];
+
+                $idLoad = (int)DB::connection()
+                    ->table('load')
+                    ->insertGetId($loadInsert);
+
+                $detailInsert = [
+                    'id_load' => $idLoad,
+                    'input_method' => 'IMPORT',
+                    'input_id' => $importId,
+                    'load_number' => $parsed['load_number'] ?? null,
+                    'truck_number' => $parsed['truck_number'] ?? null,
+                    'trailer_number' => $parsed['trailer_number'] ?? null,
+                    'miles' => $miles,
+                ];
+
+                if ($boxesNote && $this->schema->columnExists('load_detail', 'load_notes')) {
+                    $detailInsert['load_notes'] = $boxesNote;
+                }
+
+                $idLoadDetail = (int)DB::connection()->table('load_detail')->insertGetId($detailInsert);
+
+                $detailUpd = [];
+                $loadUpd = [];
+
+                $this->updater->applyBoxesNoteIfMissing($idLoadDetail, $detailUpd, $boxesNote);
+
+                if ($this->schema->columnExists('load_detail', 'ticket_number') && ($parsed['ticket_number'] ?? null)) {
+                    $detailUpd['ticket_number'] = $parsed['ticket_number'];
+                }
+
+                $this->updater->applyWeightsUpdates($detailUpd, $netLbs, $tons);
+
+                $this->updater->applyDeliveryUpdates($loadUpd, $deliveryMysql, true);
+
+                $this->updater->applyBolUpdateIfAllowed(
+                    $importId,
+                    $parsed,
+                    $idLoadDetail,
+                    $detailUpd,
+                    $bol,
+                    true
+                );
+
+                $imageImport = $this->applyDeliveredConfirmedImageImport($importId, $bol);
+
+                if (!($imageImport['ok'] ?? false)) {
+                    return [
+                        'ok' => false,
+                        'stage' => $stage,
+                        'error' => $imageImport['error'] ?? 'IMAGE_IMPORT_GRABBER failed.',
+                        'image_import' => $imageImport,
+                    ];
+                }
+
+                $reviewMysql = $this->extractReviewDate($row->payload_json ?? null);
+                if ($reviewMysql && $this->schema->columnExists('load_detail', 'review_date')) {
+                    $detailUpd['review_date'] = $reviewMysql;
+                }
+
+                $this->updater->flushUpdates($idLoad, $idLoadDetail, $loadUpd, $detailUpd);
+
+                $this->tracker->updateTracking($importId, $idLoad, $idLoadDetail);
+
+                $this->syncDeliveredConfirmedChainTracking(
+                    $importId,
+                    $parsed,
+                    $joinId,
+                    $idLoad,
+                    $idLoadDetail
+                );
+
+                return [
+                    'ok' => true,
+                    'stage' => $stage,
+                    'auto_inserted' => true,
+                    'id_load' => $idLoad,
+                    'id_load_detail' => $idLoadDetail,
+                    'updated' => [
+                        'load' => array_keys($loadUpd),
+                        'load_detail' => array_keys($detailUpd),
+                    ],
+                    'image_import' => $imageImport,
+                ];
+            }
+
             if ($stage === StageResolver::STAGE_AT_TERMINAL) {
                 if ($existing) {
                     $this->tracker->backfillIfMissing($importId, (int)$existing->id_load, (int)$existing->id_load_detail);
@@ -354,7 +522,7 @@ class InboundLoadMatchingService
                     ];
                 }
 
-                $idLoad = (int)DB::connection()->table('load')->insertGetId([
+                $loadInsert = [
                     'id_carrier' => $idCarrier,
                     'id_join' => $joinId,
                     'id_contact' => $idContact,
@@ -362,7 +530,11 @@ class InboundLoadMatchingService
                     'is_deleted' => 0,
                     'load_date' => $loadDate,
                     'is_finished' => null,
-                ]);
+                ];
+
+                $idLoad = (int)DB::connection()
+                    ->table('load')
+                    ->insertGetId($loadInsert);
 
                 $detailInsert = [
                     'id_load' => $idLoad,
@@ -391,7 +563,6 @@ class InboundLoadMatchingService
                 ];
             }
 
-            // stages 2-4 require base load
             if (!$existingTarget) {
                 return [
                     'ok' => false,
@@ -415,7 +586,6 @@ class InboundLoadMatchingService
             $this->updater->applyWeightsUpdates($detailUpd, $netLbs, $tons);
 
             if ($stage === StageResolver::STAGE_IN_TRANSIT) {
-                // ✅ BOL allowed here
                 $this->updater->applyBolUpdateIfAllowed(
                     $importId,
                     $parsed,
@@ -443,7 +613,6 @@ class InboundLoadMatchingService
             if ($stage === StageResolver::STAGE_DELIVERED_PENDING) {
                 $this->updater->applyDeliveryUpdates($loadUpd, $deliveryMysql, true);
 
-                // ❌ BOL NOT allowed here
                 $this->updater->applyBolUpdateIfAllowed(
                     $importId,
                     $parsed,
@@ -471,7 +640,6 @@ class InboundLoadMatchingService
             if ($stage === StageResolver::STAGE_DELIVERED_CONFIRMED) {
                 $this->updater->applyDeliveryUpdates($loadUpd, $deliveryMysql, true);
 
-                // ✅ BOL allowed here (and triggers REPLACED on prior imports)
                 $this->updater->applyBolUpdateIfAllowed(
                     $importId,
                     $parsed,
@@ -480,6 +648,17 @@ class InboundLoadMatchingService
                     $bol,
                     true
                 );
+
+                $imageImport = $this->applyDeliveredConfirmedImageImport($importId, $bol);
+
+                if (!($imageImport['ok'] ?? false)) {
+                    return [
+                        'ok' => false,
+                        'stage' => $stage,
+                        'error' => $imageImport['error'] ?? 'IMAGE_IMPORT_GRABBER failed.',
+                        'image_import' => $imageImport,
+                    ];
+                }
 
                 $reviewMysql = $this->extractReviewDate($row->payload_json ?? null);
                 if ($reviewMysql && $this->schema->columnExists('load_detail', 'review_date')) {
@@ -498,6 +677,7 @@ class InboundLoadMatchingService
                         'load' => array_keys($loadUpd),
                         'load_detail' => array_keys($detailUpd),
                     ],
+                    'image_import' => $imageImport,
                 ];
             }
 
@@ -505,17 +685,15 @@ class InboundLoadMatchingService
         });
     }
 
-    // ============================================================
-    // STRICT batch (RESTORED: group + forward-only)
-    // ============================================================
-
     public function processBatchStrict(array $importIds): array
     {
         $ids = [];
+
         foreach ($importIds as $v) {
             $id = (int)$v;
             if ($id > 0) $ids[] = $id;
         }
+
         $ids = array_values(array_unique($ids));
         if (count($ids) === 0) return ['ok' => false, 'error' => 'import_ids must contain at least one valid id'];
         $ids = array_slice($ids, 0, 500);
@@ -557,7 +735,6 @@ class InboundLoadMatchingService
                 ];
             }
 
-            // pick earliest id for each rank
             if (!isset($groups[$groupKey]['selected'][$rank])) {
                 $groups[$groupKey]['selected'][$rank] = (int)$r->id;
             } else {
@@ -697,13 +874,8 @@ class InboundLoadMatchingService
         return $this->dateResolver->toMysqlDatetime($review);
     }
 
-    /**
-     * ✅ FIX: delivered datetime must be based on payload datetime_delivered/datetime_at_destination
-     * so load.load_delivery_date is actually saved.
-     */
     private function resolveDeliveryMysqlForStage(string $stage, ?string $payloadJson, ?string $fallbackDeliveryTime): ?string
     {
-        // Delivered stages: prefer payload timestamps
         if (in_array($stage, [StageResolver::STAGE_DELIVERED_PENDING, StageResolver::STAGE_DELIVERED_CONFIRMED], true)) {
             $best = $this->extractFirstNonEmptyFromPayload($payloadJson, [
                 'datetime_delivered',
@@ -714,7 +886,6 @@ class InboundLoadMatchingService
             if ($best) return $this->dateResolver->toMysqlDatetime($best);
         }
 
-        // fallback: original resolver behavior
         $deliveryStr = $this->dateResolver->resolveDeliveryTimeStringFromPayload($payloadJson, $fallbackDeliveryTime);
         return $deliveryStr ? $this->dateResolver->toMysqlDatetime($deliveryStr) : null;
     }
@@ -729,6 +900,237 @@ class InboundLoadMatchingService
             $v = $this->str->strOrNull($d[$k] ?? null);
             if ($v) return $v;
         }
+
         return null;
+    }
+
+    /**
+     * Rules:
+     * - keep original import bol_path / bol_type in load_detail
+     * - IMAGE_IMPORT_GRABBER only copies the file locally
+     * - command receives 2 args: source path and local destination path
+     */
+    private function applyDeliveredConfirmedImageImport(
+        int $importId,
+        array $bol
+    ): array {
+        $sourceBolPath = $this->str->strOrNull($bol['bol_path'] ?? null);
+        if (!$sourceBolPath) {
+            return [
+                'ok' => true,
+                'skipped' => true,
+                'reason' => 'No bol_path on import row.',
+            ];
+        }
+
+        $commandBase = $this->getImageImportGrabberCommand();
+        if (!$commandBase) {
+            return [
+                'ok' => false,
+                'skipped' => false,
+                'error' => 'IMAGE_IMPORT_GRABBER is not configured.',
+            ];
+        }
+
+        $localDir = storage_path('app/loadimports/' . date('Y-m-d'));
+        if (!is_dir($localDir) && !@mkdir($localDir, 0775, true) && !is_dir($localDir)) {
+            return [
+                'ok' => false,
+                'skipped' => false,
+                'error' => "Failed to create local import directory: {$localDir}",
+            ];
+        }
+
+        $baseName = basename(str_replace('\\', '/', $sourceBolPath));
+        if (!$baseName || $baseName === '.' || $baseName === '..') {
+            $ext = strtolower((string)pathinfo($sourceBolPath, PATHINFO_EXTENSION));
+            $baseName = 'import_' . $importId . ($ext ? '.' . $ext : '');
+        }
+
+        $localPath = $localDir . DIRECTORY_SEPARATOR . $importId . '_' . $baseName;
+
+        $command = rtrim($commandBase) . ' ' . escapeshellarg($sourceBolPath) . ' ' . escapeshellarg($localPath);
+
+        $exec = $this->executeShellCommand($command);
+        if (!($exec['ok'] ?? false)) {
+            return [
+                'ok' => false,
+                'skipped' => false,
+                'error' => 'IMAGE_IMPORT_GRABBER failed for import_id=' . $importId . '. ' . ($exec['error'] ?? 'Unknown shell error.'),
+                'command' => $command,
+                'output' => $exec['output'] ?? [],
+                'exit_code' => $exec['exit_code'] ?? null,
+                'source_path' => $sourceBolPath,
+                'local_path' => $localPath,
+            ];
+        }
+
+        if (!file_exists($localPath)) {
+            return [
+                'ok' => false,
+                'skipped' => false,
+                'error' => "IMAGE_IMPORT_GRABBER succeeded but local file does not exist at: {$localPath}",
+                'command' => $command,
+                'output' => $exec['output'] ?? [],
+                'source_path' => $sourceBolPath,
+                'local_path' => $localPath,
+            ];
+        }
+
+        return [
+            'ok' => true,
+            'skipped' => false,
+            'command' => $command,
+            'source_path' => $sourceBolPath,
+            'local_path' => $localPath,
+            'bol_type' => $this->str->strOrNull($bol['bol_type'] ?? null),
+        ];
+    }
+
+    private function getImageImportGrabberCommand(): ?string
+    {
+        $v = $_ENV['IMAGE_IMPORT_GRABBER'] ?? getenv('IMAGE_IMPORT_GRABBER') ?: env('IMAGE_IMPORT_GRABBER');
+        $v = is_string($v) ? trim($v) : null;
+        return $v !== '' ? $v : null;
+    }
+
+    private function executeShellCommand(string $command): array
+    {
+        $output = [];
+        $exitCode = 0;
+
+        exec($command . ' 2>&1', $output, $exitCode);
+
+        if ($exitCode !== 0) {
+            return [
+                'ok' => false,
+                'exit_code' => $exitCode,
+                'output' => $output,
+                'error' => implode("\n", $output),
+            ];
+        }
+
+        return [
+            'ok' => true,
+            'exit_code' => $exitCode,
+            'output' => $output,
+        ];
+    }
+
+    /**
+     * When DELIVERED_CONFIRMED is processed first and becomes the official record,
+     * mark the sibling imports for the same logical load as processed too, so the
+     * earlier stages appear processed and linked to the same load/load_detail.
+     */
+    private function syncDeliveredConfirmedChainTracking(
+        int $currentImportId,
+        array $targetParsed,
+        int $targetJoinId,
+        int $idLoad,
+        int $idLoadDetail
+    ): void {
+        $targetLoadNumber = $this->str->strOrNull($targetParsed['load_number'] ?? null);
+        if (!$targetLoadNumber) return;
+
+        $candidates = $this->findImportCandidatesByLoadNumber($targetLoadNumber);
+
+        foreach ($candidates as $candidate) {
+            $candidateId = (int)($candidate->id ?? 0);
+            if ($candidateId <= 0 || $candidateId === $currentImportId) {
+                continue;
+            }
+
+            $candidateParsed = $this->parser->parseImportRow($candidate);
+
+            $candidateLoadNumber = $this->str->strOrNull($candidateParsed['load_number'] ?? null);
+            if ($candidateLoadNumber !== $targetLoadNumber) {
+                continue;
+            }
+
+            $pp = $this->locationMatcher->matchPullPointByTerminal($candidateParsed['terminal'] ?? null);
+            $pl = $this->locationMatcher->matchPadLocationByJobname($candidateParsed['jobname'] ?? null);
+            $journey = $this->journeyResolver->buildJourney($pp, $pl);
+
+            $candidateJoinId = isset($journey['join_id']) && $journey['join_id']
+                ? (int)$journey['join_id']
+                : null;
+
+            if (!$candidateJoinId || $candidateJoinId !== $targetJoinId) {
+                continue;
+            }
+
+            if (!$this->isSameLogicalLoad($targetParsed, $candidateParsed)) {
+                continue;
+            }
+
+            $candidateStage = $this->stageResolver->determineStage(
+                $candidate->payload_json ?? null,
+                $candidateParsed['state'] ?? null
+            );
+
+            $candidateRank = $this->stageResolver->stageRank($candidateStage);
+            if ($candidateRank < 1 || $candidateRank > 4) {
+                continue;
+            }
+
+            $this->tracker->updateTracking($candidateId, $idLoad, $idLoadDetail);
+        }
+    }
+
+    private function findImportCandidatesByLoadNumber(string $loadNumber): iterable
+    {
+        $loadNumber = $this->str->strOrNull($loadNumber);
+        if (!$loadNumber) return [];
+
+        $hasLoadNumberCol = $this->schema->columnExists('loadimports', 'load_number');
+        $hasPayloadJson   = $this->schema->columnExists('loadimports', 'payload_json');
+
+        if (!$hasLoadNumberCol && !$hasPayloadJson) {
+            return [];
+        }
+
+        $q = DB::connection()->table('loadimports');
+
+        $q->where(function ($w) use ($loadNumber, $hasLoadNumberCol, $hasPayloadJson) {
+            if ($hasLoadNumberCol) {
+                $w->where('load_number', $loadNumber);
+            }
+
+            if ($hasPayloadJson) {
+                if ($hasLoadNumberCol) {
+                    $w->orWhereRaw(
+                        "TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.loadnumber'))) = ?",
+                        [$loadNumber]
+                    );
+                } else {
+                    $w->whereRaw(
+                        "TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.loadnumber'))) = ?",
+                        [$loadNumber]
+                    );
+                }
+            }
+        });
+
+        return $q->orderBy('id')->get();
+    }
+
+    private function isSameLogicalLoad(array $targetParsed, array $candidateParsed): bool
+    {
+        $targetLoadNumber = $this->str->strOrNull($targetParsed['load_number'] ?? null);
+        $candidateLoadNumber = $this->str->strOrNull($candidateParsed['load_number'] ?? null);
+
+        if (!$targetLoadNumber || !$candidateLoadNumber) return false;
+        if (strcasecmp($targetLoadNumber, $candidateLoadNumber) !== 0) return false;
+
+        foreach (['jobname', 'terminal', 'truck_number', 'trailer_number'] as $key) {
+            $a = $this->str->strOrNull($targetParsed[$key] ?? null);
+            $b = $this->str->strOrNull($candidateParsed[$key] ?? null);
+
+            if ($a && $b && strcasecmp($a, $b) !== 0) {
+                return false;
+            }
+        }
+
+        return true;
     }
 }
