@@ -29,3 +29,10 @@ export async function fetchJson(url, options = {}) {
     const res = await api.request(config)
     return res.data
 }
+
+export async function fetchInboundLoadProcessLogs(params = {}) {
+    return fetchJson('/api/inbound-loads/logs', {
+        method: 'GET',
+        params,
+    })
+}

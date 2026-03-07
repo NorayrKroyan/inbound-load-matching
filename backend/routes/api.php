@@ -14,6 +14,7 @@ Route::get('/health', fn () => response()->json(['ok' => true]));
 Route::get('/inbound-loads/queue', [InboundLoadMatchingController::class, 'queue']);
 Route::post('/inbound-loads/process', [InboundLoadMatchingController::class, 'process']);
 Route::post('/inbound-loads/process-batch', [InboundLoadMatchingController::class, 'processBatch']);
+Route::get('/inbound-loads/logs', [InboundLoadMatchingController::class, 'logs']);
 
 
 

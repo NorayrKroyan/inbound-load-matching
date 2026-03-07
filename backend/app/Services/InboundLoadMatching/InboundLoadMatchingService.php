@@ -2,9 +2,12 @@
 
 namespace App\Services\InboundLoadMatching;
 
+use Throwable;
 use Illuminate\Support\Facades\DB;
 use App\Services\InboundLoadMatching\Support\DbSchema;
 use App\Services\InboundLoadMatching\Support\Str;
+use App\Services\InboundLoadMatching\Support\LoadImportProcessLogger;
+use App\Services\InboundLoadMatching\Support\LoadImportProcessRunType;
 
 use App\Services\InboundLoadMatching\Parsing\ImportRowParser;
 use App\Services\InboundLoadMatching\Parsing\StageResolver;
@@ -43,6 +46,7 @@ class InboundLoadMatchingService
         $this->stageGuard = new LoadStageGuard($this->schema, $this->str, $this->stageResolver);
 
         $this->updater = new LoadUpdater($this->schema, $this->boxesBuilder, $this->bolExtractor);
+        $this->processLogger = new LoadImportProcessLogger();
     }
 
     private DbSchema $schema;
@@ -62,6 +66,7 @@ class InboundLoadMatchingService
     private LoadimportsTracker $tracker;
     private LoadStageGuard $stageGuard;
     private LoadUpdater $updater;
+    private LoadImportProcessLogger $processLogger;
 
     public function buildQueue(int $limit, string $only, string $q, string $matchFilter): array
     {
@@ -195,6 +200,78 @@ class InboundLoadMatchingService
         }
 
         return $out;
+    }
+
+    public function processSingleWithLogging(int $importId): array
+    {
+        $sessionId = $this->processLogger->newSessionId();
+
+        $row = DB::connection()->table('loadimports')->where('id', $importId)->first();
+
+        if (!$row) {
+            $this->processLogger->warning(
+                sessionId: $sessionId,
+                loadimportId: $importId,
+                runType: LoadImportProcessRunType::SINGLE_PROCESS,
+                event: 'review_not_found',
+                status: 'failed',
+                message: 'Import not found',
+                stageDetected: null,
+                context: ['import_id' => $importId]
+            );
+
+            return ['ok' => false, 'error' => 'Import not found'];
+        }
+
+        $payload = $row->payload_json ?? null;
+        $state = $row->state ?? null;
+        $stage = $this->stageResolver->determineStage($payload, $state);
+        $isInserted = property_exists($row, 'is_inserted') ? (int)($row->is_inserted ?? 0) : 0;
+
+        $this->logStarted(
+            sessionId: $sessionId,
+            importId: $importId,
+            runType: LoadImportProcessRunType::SINGLE_PROCESS,
+            stageDetected: $stage,
+            context: [
+                'mode' => ($stage === StageResolver::STAGE_DELIVERED_CONFIRMED && $isInserted === 0) ? 'bootstrap_or_final' : 'strict',
+            ]
+        );
+
+        try {
+            if ($stage === StageResolver::STAGE_DELIVERED_CONFIRMED && $isInserted === 0) {
+                $res = $this->processImport($importId);
+            } else {
+                $res = $this->processImportStrict($importId);
+            }
+
+            $this->logCompleted(
+                sessionId: $sessionId,
+                importId: $importId,
+                runType: LoadImportProcessRunType::SINGLE_PROCESS,
+                stageDetected: $stage,
+                result: $res
+            );
+
+            $res['session_id'] = $sessionId;
+
+            return $res;
+        } catch (Throwable $e) {
+            $this->processLogger->exception(
+                sessionId: $sessionId,
+                loadimportId: $importId,
+                runType: LoadImportProcessRunType::SINGLE_PROCESS,
+                event: 'review_exception',
+                e: $e,
+                stageDetected: $stage
+            );
+
+            return [
+                'ok' => false,
+                'error' => $e->getMessage(),
+                'session_id' => $sessionId,
+            ];
+        }
     }
 
     public function processImportStrict(int $importId): array
@@ -686,8 +763,28 @@ class InboundLoadMatchingService
         });
     }
 
-    public function processBatchStrict(array $importIds): array
+    public function processBatchWithLogging(array $importIds, string $runType = LoadImportProcessRunType::BATCH_PROCESS): array
     {
+        $sessionId = $this->processLogger->newSessionId();
+
+        $res = $this->processBatchStrict($importIds, $sessionId, $runType);
+        $res['session_id'] = $sessionId;
+
+        return $res;
+    }
+
+    public function processAutoWithLogging(array $importIds): array
+    {
+        return $this->processBatchWithLogging($importIds, LoadImportProcessRunType::AUTO_PROCESS);
+    }
+
+    public function processBatchStrict(
+        array $importIds,
+        ?string $sessionId = null,
+        string $runType = LoadImportProcessRunType::BATCH_PROCESS
+    ): array {
+        $sessionId = $sessionId ?: $this->processLogger->newSessionId();
+
         $ids = [];
 
         foreach ($importIds as $v) {
@@ -707,6 +804,33 @@ class InboundLoadMatchingService
         $groups = [];
         $orphans = [];
 
+        $foundIds = [];
+        foreach ($rows as $row) {
+            $foundIds[] = (int)$row->id;
+        }
+
+        $missingIds = array_values(array_diff($ids, $foundIds));
+        foreach ($missingIds as $missingId) {
+            $orphans[] = [
+                'import_id' => (int)$missingId,
+                'ok' => false,
+                'error' => 'Import not found',
+            ];
+
+            $this->processLogger->warning(
+                sessionId: $sessionId,
+                loadimportId: (int)$missingId,
+                runType: $runType,
+                event: 'review_not_found',
+                status: 'failed',
+                message: 'Import not found',
+                stageDetected: null,
+                context: [
+                    'source' => 'batch_request',
+                ]
+            );
+        }
+
         foreach ($rows as $r) {
             $parsed = $this->parser->parseImportRow($r);
             $journey = $this->resolveJourneyForParsed($parsed);
@@ -714,12 +838,41 @@ class InboundLoadMatchingService
             $joinId = isset($journey['join_id']) && $journey['join_id'] ? (int)$journey['join_id'] : null;
             if (!$joinId || (($journey['status'] ?? '') !== 'READY')) {
                 $orphans[] = ['import_id' => (int)$r->id, 'ok' => false, 'error' => 'Journey not READY / join_id missing'];
+
+                $stage = $this->stageResolver->determineStage($r->payload_json ?? null, $parsed['state'] ?? null);
+
+                $this->processLogger->warning(
+                    sessionId: $sessionId,
+                    loadimportId: (int)$r->id,
+                    runType: $runType,
+                    event: 'review_rejected',
+                    status: 'failed',
+                    message: 'Journey not READY / join_id missing',
+                    stageDetected: $stage,
+                    context: [
+                        'load_number' => $parsed['load_number'] ?? null,
+                    ]
+                );
+
                 continue;
             }
 
             $loadNumber = $this->str->strOrNull($parsed['load_number'] ?? null);
             if (!$loadNumber) {
                 $orphans[] = ['import_id' => (int)$r->id, 'ok' => false, 'error' => 'Missing load_number; cannot group/sequence'];
+
+                $stage = $this->stageResolver->determineStage($r->payload_json ?? null, $parsed['state'] ?? null);
+
+                $this->processLogger->warning(
+                    sessionId: $sessionId,
+                    loadimportId: (int)$r->id,
+                    runType: $runType,
+                    event: 'review_rejected',
+                    status: 'failed',
+                    message: 'Missing load_number; cannot group/sequence',
+                    stageDetected: $stage
+                );
+
                 continue;
             }
 
@@ -744,6 +897,7 @@ class InboundLoadMatchingService
             $joinId = (int)$g['join_id'];
             $loadNumber = (string)$g['load_number'];
             $selectedIds = array_values(array_unique($g['selected_ids']));
+            $firstSelectedId = (int)($selectedIds[0] ?? 0);
 
             $currentRank = $this->stageGuard->inferCurrentStageRankFromDb($joinId, $loadNumber);
             $availableByRank = $this->findBestImportsForGroup($joinId, $loadNumber);
@@ -765,6 +919,25 @@ class InboundLoadMatchingService
                 $trace['skipped_completed'] = true;
                 $results[] = $trace;
                 $okGroups++;
+
+                if ($firstSelectedId > 0) {
+                    $this->processLogger->info(
+                        sessionId: $sessionId,
+                        loadimportId: $firstSelectedId,
+                        runType: $runType,
+                        event: 'review_skipped',
+                        status: 'skipped',
+                        message: 'Group already fully processed in DB',
+                        stageDetected: StageResolver::STAGE_DELIVERED_CONFIRMED,
+                        context: [
+                            'group_key' => $gk,
+                            'join_id' => $joinId,
+                            'load_number' => $loadNumber,
+                            'selected_ids' => $selectedIds,
+                        ]
+                    );
+                }
+
                 continue;
             }
 
@@ -776,6 +949,25 @@ class InboundLoadMatchingService
                 ];
                 $results[] = $trace;
                 $failGroups++;
+
+                if ($firstSelectedId > 0) {
+                    $this->processLogger->warning(
+                        sessionId: $sessionId,
+                        loadimportId: $firstSelectedId,
+                        runType: $runType,
+                        event: 'review_rejected',
+                        status: 'failed',
+                        message: 'No usable import rows found for this join_id + load_number group',
+                        stageDetected: null,
+                        context: [
+                            'group_key' => $gk,
+                            'join_id' => $joinId,
+                            'load_number' => $loadNumber,
+                            'selected_ids' => $selectedIds,
+                        ]
+                    );
+                }
+
                 continue;
             }
 
@@ -793,6 +985,27 @@ class InboundLoadMatchingService
                     $trace['nothing_to_do'] = true;
                     $results[] = $trace;
                     $okGroups++;
+
+                    if ($firstSelectedId > 0) {
+                        $this->processLogger->info(
+                            sessionId: $sessionId,
+                            loadimportId: $firstSelectedId,
+                            runType: $runType,
+                            event: 'review_skipped',
+                            status: 'skipped',
+                            message: 'Nothing to do for this group',
+                            stageDetected: $this->stageResolver->rankToStage($currentRank),
+                            context: [
+                                'group_key' => $gk,
+                                'join_id' => $joinId,
+                                'load_number' => $loadNumber,
+                                'selected_ids' => $selectedIds,
+                                'current_rank' => $currentRank,
+                                'highest_available_rank' => $highestAvailableRank,
+                            ]
+                        );
+                    }
+
                     continue;
                 }
 
@@ -804,20 +1017,62 @@ class InboundLoadMatchingService
                     ];
                     $results[] = $trace;
                     $failGroups++;
+
+                    if ($firstSelectedId > 0) {
+                        $this->processLogger->warning(
+                            sessionId: $sessionId,
+                            loadimportId: $firstSelectedId,
+                            runType: $runType,
+                            event: 'review_rejected',
+                            status: 'failed',
+                            message: 'No AT_TERMINAL import exists for this group and no DELIVERED_CONFIRMED bootstrap row was found',
+                            stageDetected: null,
+                            context: [
+                                'group_key' => $gk,
+                                'join_id' => $joinId,
+                                'load_number' => $loadNumber,
+                                'selected_ids' => $selectedIds,
+                            ]
+                        );
+                    }
+
                     continue;
                 }
 
                 for ($rank = $currentRank + 1; $rank <= $highestAvailableRank; $rank++) {
                     if (!isset($availableByRank[$rank])) {
+                        $missingStage = $this->stageResolver->rankToStage($rank);
+
                         $trace['ok'] = false;
                         $trace['steps'][] = [
                             'ok' => false,
                             'rank' => $rank,
-                            'stage' => $this->stageResolver->rankToStage($rank),
+                            'stage' => $missingStage,
                             'error' => 'Missing import row for required next stage.',
                         ];
                         $results[] = $trace;
                         $failGroups++;
+
+                        if ($firstSelectedId > 0) {
+                            $this->processLogger->warning(
+                                sessionId: $sessionId,
+                                loadimportId: $firstSelectedId,
+                                runType: $runType,
+                                event: 'review_rejected',
+                                status: 'failed',
+                                message: 'Missing import row for required next stage',
+                                stageDetected: $missingStage,
+                                context: [
+                                    'group_key' => $gk,
+                                    'join_id' => $joinId,
+                                    'load_number' => $loadNumber,
+                                    'selected_ids' => $selectedIds,
+                                    'current_rank' => $currentRank,
+                                    'missing_rank' => $rank,
+                                ]
+                            );
+                        }
+
                         continue 2;
                     }
 
@@ -832,7 +1087,53 @@ class InboundLoadMatchingService
                 $importId = (int)$availableByRank[$rank];
                 $stage = $this->stageResolver->rankToStage($rank);
 
-                $res = $this->processImport($importId, $stage);
+                $this->logStarted(
+                    sessionId: $sessionId,
+                    importId: $importId,
+                    runType: $runType,
+                    stageDetected: $stage,
+                    context: [
+                        'group_key' => $gk,
+                        'join_id' => $joinId,
+                        'load_number' => $loadNumber,
+                        'selected_ids' => $selectedIds,
+                        'rank' => $rank,
+                        'mode' => $trace['mode'] ?? null,
+                    ]
+                );
+
+                try {
+                    $res = $this->processImport($importId, $stage);
+
+                    $this->logCompleted(
+                        sessionId: $sessionId,
+                        importId: $importId,
+                        runType: $runType,
+                        stageDetected: $stage,
+                        result: $res
+                    );
+                } catch (Throwable $e) {
+                    $res = [
+                        'ok' => false,
+                        'stage' => $stage,
+                        'error' => $e->getMessage(),
+                    ];
+
+                    $this->processLogger->exception(
+                        sessionId: $sessionId,
+                        loadimportId: $importId,
+                        runType: $runType,
+                        event: 'review_exception',
+                        e: $e,
+                        stageDetected: $stage,
+                        context: [
+                            'group_key' => $gk,
+                            'join_id' => $joinId,
+                            'load_number' => $loadNumber,
+                            'rank' => $rank,
+                        ]
+                    );
+                }
 
                 $trace['steps'][] = [
                     'ok' => (bool)($res['ok'] ?? false),
@@ -871,7 +1172,83 @@ class InboundLoadMatchingService
 
     public function processBatch(array $importIds): array
     {
-        return $this->processBatchStrict($importIds);
+        return $this->processBatchWithLogging($importIds);
+    }
+
+    private function logStarted(
+        string $sessionId,
+        int $importId,
+        string $runType,
+        ?string $stageDetected,
+        array $context = []
+    ): void {
+        $label = $this->runTypeLabel($runType);
+
+        $this->processLogger->info(
+            sessionId: $sessionId,
+            loadimportId: $importId,
+            runType: $runType,
+            event: 'review_started',
+            status: 'started',
+            message: $label . ' started',
+            stageDetected: $stageDetected,
+            context: $context
+        );
+    }
+
+    private function logCompleted(
+        string $sessionId,
+        int $importId,
+        string $runType,
+        ?string $stageDetected,
+        array $result
+    ): void {
+        $label = $this->runTypeLabel($runType);
+        $ok = (bool)($result['ok'] ?? false);
+        $message = (string)($result['error'] ?? $result['message'] ?? ($ok ? $label . ' completed successfully' : $label . ' failed'));
+
+        $idLoad = isset($result['id_load']) && $result['id_load'] !== null ? (int)$result['id_load'] : null;
+        $idLoadDetail = isset($result['id_load_detail']) && $result['id_load_detail'] !== null ? (int)$result['id_load_detail'] : null;
+        $resultStage = isset($result['stage']) && $result['stage'] ? (string)$result['stage'] : $stageDetected;
+
+        if ($ok) {
+            $this->processLogger->info(
+                sessionId: $sessionId,
+                loadimportId: $importId,
+                runType: $runType,
+                event: 'review_completed',
+                status: 'success',
+                message: $message,
+                stageDetected: $resultStage,
+                idLoad: $idLoad,
+                idLoadDetail: $idLoadDetail,
+                context: $result
+            );
+            return;
+        }
+
+        $this->processLogger->warning(
+            sessionId: $sessionId,
+            loadimportId: $importId,
+            runType: $runType,
+            event: 'review_completed',
+            status: 'failed',
+            message: $message,
+            stageDetected: $resultStage,
+            idLoad: $idLoad,
+            idLoadDetail: $idLoadDetail,
+            context: $result
+        );
+    }
+
+    private function runTypeLabel(string $runType): string
+    {
+        return match ($runType) {
+            LoadImportProcessRunType::SINGLE_PROCESS => 'Single process',
+            LoadImportProcessRunType::BATCH_PROCESS => 'Batch process',
+            LoadImportProcessRunType::AUTO_PROCESS => 'Auto process',
+            default => 'Process',
+        };
     }
 
     private function extractReviewDate(?string $payloadJson): ?string
@@ -938,7 +1315,7 @@ class InboundLoadMatchingService
             ];
         }
 
-        $exec = $this->executeShellCommand($command . ' ' . $sourceBolPath);
+        $exec = $this->executeShellCommand($command);
 
         if (!($exec['ok'] ?? false)) {
             return [

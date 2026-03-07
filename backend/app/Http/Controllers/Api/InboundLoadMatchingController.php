@@ -6,8 +6,7 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use App\Services\InboundLoadMatching\InboundLoadMatchingService;
-use App\Services\InboundLoadMatching\Support\Str;
-use App\Services\InboundLoadMatching\Parsing\StageResolver;
+use App\Services\InboundLoadMatching\Support\LoadImportProcessRunType;
 
 class InboundLoadMatchingController extends Controller
 {
@@ -40,35 +39,7 @@ class InboundLoadMatchingController extends Controller
             ], 422);
         }
 
-        $row = DB::connection()
-            ->table('loadimports')
-            ->where('id', $importId)
-            ->first();
-
-        if (!$row) {
-            return response()->json([
-                'ok' => false,
-                'error' => 'Import not found'
-            ], 404);
-        }
-
-        $str = new Str();
-        $stageResolver = new StageResolver($str);
-
-        $payload = $row->payload_json ?? null;
-        $state   = $row->state ?? null;
-
-        $stage = $stageResolver->determineStage($payload, $state);
-
-        $isInserted = property_exists($row, 'is_inserted')
-            ? (int)($row->is_inserted ?? 0)
-            : 0;
-
-        if ($stage === StageResolver::STAGE_DELIVERED_CONFIRMED && $isInserted === 0) {
-            $res = $svc->processImport($importId);
-        } else {
-            $res = $svc->processImportStrict($importId);
-        }
+        $res = $svc->processSingleWithLogging($importId);
 
         return response()->json($res, ($res['ok'] ?? false) ? 200 : 422);
     }
@@ -88,7 +59,9 @@ class InboundLoadMatchingController extends Controller
 
         foreach ($ids as $v) {
             $id = (int)$v;
-            if ($id > 0) $clean[] = $id;
+            if ($id > 0) {
+                $clean[] = $id;
+            }
         }
 
         $clean = array_values(array_unique($clean));
@@ -101,8 +74,74 @@ class InboundLoadMatchingController extends Controller
             ], 422);
         }
 
-        $res = $svc->processBatchStrict($clean);
+        $res = $svc->processBatchWithLogging($clean);
 
         return response()->json($res, 200);
+    }
+
+    public function logs(Request $request)
+    {
+        $limit = (int)($request->query('limit', 200));
+        $limit = max(1, min($limit, 500));
+
+        $q = trim((string)$request->query('q', ''));
+        $runType = trim((string)$request->query('run_type', ''));
+        $severity = trim((string)$request->query('severity', ''));
+        $status = trim((string)$request->query('status', ''));
+        $sessionId = trim((string)$request->query('session_id', ''));
+
+        $query = DB::connection()->table('loadimport_process_log');
+
+        if ($runType !== '') {
+            $query->where('run_type', $runType);
+        }
+
+        if ($severity !== '') {
+            $query->where('severity', $severity);
+        }
+
+        if ($status !== '') {
+            $query->where('status', $status);
+        }
+
+        if ($sessionId !== '') {
+            $query->where('session_id', $sessionId);
+        }
+
+        if ($q !== '') {
+            $like = '%' . $q . '%';
+
+            $query->where(function ($sub) use ($like) {
+                $sub->where('session_id', 'like', $like)
+                    ->orWhere('run_type', 'like', $like)
+                    ->orWhere('event', 'like', $like)
+                    ->orWhere('severity', 'like', $like)
+                    ->orWhere('status', 'like', $like)
+                    ->orWhere('stage_detected', 'like', $like)
+                    ->orWhere('message', 'like', $like)
+                    ->orWhereRaw('CAST(loadimport_id AS CHAR) LIKE ?', [$like])
+                    ->orWhereRaw('CAST(id_load AS CHAR) LIKE ?', [$like])
+                    ->orWhereRaw('CAST(id_load_detail AS CHAR) LIKE ?', [$like]);
+            });
+        }
+
+        $rows = $query
+            ->orderByDesc('id')
+            ->limit($limit)
+            ->get()
+            ->map(function ($row) {
+                $row->run_type_label = LoadImportProcessRunType::label($row->run_type);
+                $row->context_json = $row->context_json
+                    ? json_decode($row->context_json, true)
+                    : null;
+
+                return $row;
+            })
+            ->values();
+
+        return response()->json([
+            'ok' => true,
+            'rows' => $rows,
+        ]);
     }
 }

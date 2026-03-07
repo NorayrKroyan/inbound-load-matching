@@ -91,8 +91,8 @@
           </div>
 
           <!-- Row 2: buttons -->
-          <div class="lg:col-span-2 lg:col-start-5 self-end">
-            <div class="grid grid-cols-2 gap-2">
+          <div class="lg:col-span-3 lg:col-start-4 self-end">
+            <div class="grid grid-cols-3 gap-2">
               <button
                   class="h-10 rounded-xl border border-slate-900 bg-slate-950 px-3 text-sm font-medium text-white hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
                   :disabled="loading"
@@ -109,8 +109,16 @@
               >
                 {{ bulkProcessing ? `Processing ${bulkDone}/${bulkTotal}` : `Process (${selectedCount})` }}
               </button>
+
+              <router-link
+                  to="/inbound-loads/logs"
+                  class="flex h-10 items-center justify-center rounded-xl border border-slate-300 bg-white px-3 text-sm font-medium text-slate-900 hover:bg-slate-50"
+              >
+                Logs
+              </router-link>
             </div>
-          </div>        </div>
+          </div>
+        </div>
 
         <div
             v-if="bulkMsg"
