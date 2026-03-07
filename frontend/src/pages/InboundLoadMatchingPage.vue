@@ -123,8 +123,8 @@
                   :checked="isSelected(r.import_id)"
                   @change="toggleRow(r)"
                   :title="isSelectable(r)
-        ? 'Select for bulk processing'
-        : 'Not eligible (must be GREEN + READY + resolved driver + carrier + join)'"
+                    ? 'Select for bulk processing'
+                    : 'Not eligible (must be GREEN + READY + resolved driver + carrier + join)'"
               />
             </div>
           </td>
@@ -165,7 +165,13 @@
           <td class="border-b border-slate-100 px-3 py-2">{{ r.jobname || '—' }}</td>
           <td class="border-b border-slate-100 px-3 py-2">{{ r.terminal || '—' }}</td>
           <td class="border-b border-slate-100 px-3 py-2 font-mono">{{ r.load_number || '—' }}</td>
-          <td class="border-b border-slate-100 px-3 py-2 font-mono">{{ r.state || '—' }}</td>
+
+          <td
+              class="border-b border-slate-100 px-3 py-2 font-mono"
+              :title="r.state || ''"
+          >
+            {{ r.status_label || '—' }}
+          </td>
 
           <!-- Driver Match -->
           <td class="border-b border-slate-100 px-3 py-2">
@@ -334,8 +340,6 @@ const {
   confidenceClasses,
   journeyClasses
 } = useInboundLoadMatching()
-
-
 
 load()
 </script>

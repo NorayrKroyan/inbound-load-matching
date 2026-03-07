@@ -131,6 +131,7 @@ class InboundLoadMatchingService
             $journey = $this->journeyResolver->buildJourney($pullPointMatch, $padLocationMatch);
 
             $stage = $this->stageResolver->determineStage($r->payload_json ?? null, $parsed['state'] ?? null);
+            $statusLabel = $this->formatQueueStatusFromStage($stage);
 
             $weights = $this->weights->extractWeightsFromPayload($r->payload_json ?? null);
             $boxesNote = $this->boxesBuilder->buildBoxesNote($weights['box1'] ?? null, $weights['box2'] ?? null);
@@ -150,6 +151,7 @@ class InboundLoadMatchingService
                 'created_at' => $r->created_at ?? null,
                 'updated_at' => $r->updated_at ?? null,
                 'stage' => $stage,
+                'status_label' => $statusLabel,
 
                 'driver_name' => $parsed['driver_name'],
                 'truck_number' => $parsed['truck_number'],
@@ -936,7 +938,7 @@ class InboundLoadMatchingService
             ];
         }
 
-        $exec = $this->executeShellCommand($command);
+        $exec = $this->executeShellCommand($command . ' ' . $sourceBolPath);
 
         if (!($exec['ok'] ?? false)) {
             return [
@@ -1125,5 +1127,16 @@ class InboundLoadMatchingService
         });
 
         return $q->orderBy('id')->get();
+    }
+
+    private function formatQueueStatusFromStage(string $stage): string
+    {
+        return match ($stage) {
+            StageResolver::STAGE_DELIVERED_CONFIRMED => 'DELIVERED-CONFIRMED',
+            StageResolver::STAGE_DELIVERED_PENDING   => 'DELIVERED-PENDING',
+            StageResolver::STAGE_IN_TRANSIT          => 'IN TRANSIT',
+            StageResolver::STAGE_AT_TERMINAL         => 'AT TERMINAL',
+            default                                  => strtoupper(str_replace('_', ' ', $stage)),
+        };
     }
 }
