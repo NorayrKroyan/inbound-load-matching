@@ -89,11 +89,13 @@ class LoadUpdater
         if (!is_string($bolPath) || trim($bolPath) === '') return;
         if (!is_string($bolType) || trim($bolType) === '') return;
 
+        $normalizedBolPath = $this->normalizeInboundBolPath($bolPath);
+
         if (!$this->schema->columnExists('load_detail', 'bol_path')) return;
         if (!$this->schema->columnExists('load_detail', 'bol_type')) return;
 
         // 1) set BOL on load_detail
-        $detailUpd['bol_path'] = $bolPath;
+        $detailUpd['bol_path'] = $normalizedBolPath;
         $detailUpd['bol_type'] = $bolType;
 
         // 2) mark OTHER related loadimports rows as REPLACED (current row MUST NOT be modified)
@@ -246,6 +248,22 @@ class LoadUpdater
         if (!preg_match('/\.[A-Za-z0-9]{2,10}($|\?)/', $path)) return $path;
 
         return $this->bolExtractor->buildReplacedName($path);
+    }
+
+    private function normalizeInboundBolPath(string $path): string
+    {
+        $path = trim($path);
+        if ($path === '') return '';
+
+        $cleanPath = preg_replace('/\?.*$/', '', $path);
+        $cleanPath = str_replace('\\', '/', $cleanPath);
+        $fileName = basename($cleanPath);
+
+        if ($fileName === '' || $fileName === '.' || $fileName === '..') {
+            return '';
+        }
+
+        return '/storage/attachments/' . ltrim($fileName, '/');
     }
 
     // ------------------ Flush ------------------

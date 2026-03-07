@@ -202,11 +202,9 @@ class InboundLoadMatchingService
 
         $parsed = $this->parser->parseImportRow($row);
 
-        $pp = $this->locationMatcher->matchPullPointByTerminal($parsed['terminal'] ?? null);
-        $pl = $this->locationMatcher->matchPadLocationByJobname($parsed['jobname'] ?? null);
-        $journey = $this->journeyResolver->buildJourney($pp, $pl);
-
+        $journey = $this->resolveJourneyForParsed($parsed);
         $joinId = isset($journey['join_id']) && $journey['join_id'] ? (int)$journey['join_id'] : null;
+
         if (!$joinId || (($journey['status'] ?? '') !== 'READY')) {
             return ['ok' => false, 'error' => 'Journey is not READY / join_id missing. Cannot process.'];
         }
@@ -667,6 +665,7 @@ class InboundLoadMatchingService
 
                 $this->updater->flushUpdates($idLoad, $idLoadDetail, $loadUpd, $detailUpd);
                 $this->tracker->updateTracking($importId, $idLoad, $idLoadDetail);
+                $this->syncDeliveredConfirmedChainTracking($importId, $parsed, $joinId, $idLoad, $idLoadDetail);
 
                 return [
                     'ok' => true,
@@ -695,7 +694,10 @@ class InboundLoadMatchingService
         }
 
         $ids = array_values(array_unique($ids));
-        if (count($ids) === 0) return ['ok' => false, 'error' => 'import_ids must contain at least one valid id'];
+        if (count($ids) === 0) {
+            return ['ok' => false, 'error' => 'import_ids must contain at least one valid id'];
+        }
+
         $ids = array_slice($ids, 0, 500);
 
         $rows = DB::connection()->table('loadimports')->whereIn('id', $ids)->get();
@@ -705,13 +707,10 @@ class InboundLoadMatchingService
 
         foreach ($rows as $r) {
             $parsed = $this->parser->parseImportRow($r);
-
-            $pp = $this->locationMatcher->matchPullPointByTerminal($parsed['terminal'] ?? null);
-            $pl = $this->locationMatcher->matchPadLocationByJobname($parsed['jobname'] ?? null);
-            $journey = $this->journeyResolver->buildJourney($pp, $pl);
+            $journey = $this->resolveJourneyForParsed($parsed);
 
             $joinId = isset($journey['join_id']) && $journey['join_id'] ? (int)$journey['join_id'] : null;
-            if (!$joinId) {
+            if (!$joinId || (($journey['status'] ?? '') !== 'READY')) {
                 $orphans[] = ['import_id' => (int)$r->id, 'ok' => false, 'error' => 'Journey not READY / join_id missing'];
                 continue;
             }
@@ -722,25 +721,17 @@ class InboundLoadMatchingService
                 continue;
             }
 
-            $stage = $this->stageResolver->determineStage($r->payload_json ?? null, $parsed['state'] ?? null);
-            $rank = $this->stageResolver->stageRank($stage);
-
             $groupKey = $joinId . '|' . $loadNumber;
 
             if (!isset($groups[$groupKey])) {
                 $groups[$groupKey] = [
                     'join_id' => $joinId,
                     'load_number' => $loadNumber,
-                    'selected' => [],
+                    'selected_ids' => [],
                 ];
             }
 
-            if (!isset($groups[$groupKey]['selected'][$rank])) {
-                $groups[$groupKey]['selected'][$rank] = (int)$r->id;
-            } else {
-                $cur = (int)$groups[$groupKey]['selected'][$rank];
-                if ((int)$r->id < $cur) $groups[$groupKey]['selected'][$rank] = (int)$r->id;
-            }
+            $groups[$groupKey]['selected_ids'][] = (int)$r->id;
         }
 
         $results = [];
@@ -750,73 +741,93 @@ class InboundLoadMatchingService
         foreach ($groups as $gk => $g) {
             $joinId = (int)$g['join_id'];
             $loadNumber = (string)$g['load_number'];
-            $selected = $g['selected'];
+            $selectedIds = array_values(array_unique($g['selected_ids']));
 
             $currentRank = $this->stageGuard->inferCurrentStageRankFromDb($joinId, $loadNumber);
-
-            $selectedRanks = array_keys($selected);
-            sort($selectedRanks);
+            $availableByRank = $this->findBestImportsForGroup($joinId, $loadNumber);
+            $availableRanks = array_keys($availableByRank);
+            sort($availableRanks);
 
             $trace = [
                 'group_key' => $gk,
                 'join_id' => $joinId,
                 'load_number' => $loadNumber,
+                'selected_ids' => $selectedIds,
                 'current_rank' => $currentRank,
-                'selected_ranks' => $selectedRanks,
+                'available_ranks' => $availableRanks,
                 'steps' => [],
             ];
 
-            if ($currentRank === 0) {
-                if (!in_array(1, $selectedRanks, true)) {
+            if ($currentRank >= 4) {
+                $trace['ok'] = true;
+                $trace['skipped_completed'] = true;
+                $results[] = $trace;
+                $okGroups++;
+                continue;
+            }
+
+            if (empty($availableByRank)) {
+                $trace['ok'] = false;
+                $trace['steps'][] = [
+                    'ok' => false,
+                    'error' => 'No usable import rows found for this join_id + load_number group.',
+                ];
+                $results[] = $trace;
+                $failGroups++;
+                continue;
+            }
+
+            $planRanks = [];
+
+            if (isset($availableByRank[4])) {
+                $planRanks = [4];
+                $trace['mode'] = 'FINAL_ONLY';
+            } else {
+                $highestAvailableRank = max($availableRanks);
+                $trace['mode'] = 'SEQUENTIAL';
+
+                if ($highestAvailableRank <= $currentRank) {
+                    $trace['ok'] = true;
+                    $trace['nothing_to_do'] = true;
+                    $results[] = $trace;
+                    $okGroups++;
+                    continue;
+                }
+
+                if ($currentRank === 0 && !isset($availableByRank[1])) {
                     $trace['ok'] = false;
                     $trace['steps'][] = [
                         'ok' => false,
-                        'error' => 'No existing AT_TERMINAL in DB. You must select an AT_TERMINAL import first.',
+                        'error' => 'No AT_TERMINAL import exists for this join_id + load_number group, and no DELIVERED_CONFIRMED bootstrap row was found.',
                     ];
                     $results[] = $trace;
                     $failGroups++;
                     continue;
                 }
+
+                for ($rank = $currentRank + 1; $rank <= $highestAvailableRank; $rank++) {
+                    if (!isset($availableByRank[$rank])) {
+                        $trace['ok'] = false;
+                        $trace['steps'][] = [
+                            'ok' => false,
+                            'rank' => $rank,
+                            'stage' => $this->stageResolver->rankToStage($rank),
+                            'error' => 'Missing import row for required next stage.',
+                        ];
+                        $results[] = $trace;
+                        $failGroups++;
+                        continue 2;
+                    }
+
+                    $planRanks[] = $rank;
+                }
             }
 
+            $trace['plan_ranks'] = $planRanks;
             $groupOk = true;
 
-            foreach ($selectedRanks as $rank) {
-                if ($rank <= $currentRank) {
-                    $groupOk = false;
-                    $trace['steps'][] = [
-                        'ok' => false,
-                        'rank' => $rank,
-                        'stage' => $this->stageResolver->rankToStage($rank),
-                        'error' => "Selected stage {$this->stageResolver->rankToStage($rank)} is not allowed because current stage is {$this->stageResolver->rankToStage(max(1, $currentRank))} (rank={$currentRank}). You can only process the NEXT stage.",
-                    ];
-                    break;
-                }
-
-                $expectedNext = $currentRank + 1;
-                if ($rank !== $expectedNext) {
-                    $groupOk = false;
-                    $trace['steps'][] = [
-                        'ok' => false,
-                        'rank' => $rank,
-                        'stage' => $this->stageResolver->rankToStage($rank),
-                        'error' => "Invalid jump. Current rank={$currentRank}. Next allowed is {$this->stageResolver->rankToStage($expectedNext)} (rank={$expectedNext}). You selected {$this->stageResolver->rankToStage($rank)} (rank={$rank}).",
-                    ];
-                    break;
-                }
-
-                $importId = (int)($selected[$rank] ?? 0);
-                if ($importId <= 0) {
-                    $groupOk = false;
-                    $trace['steps'][] = [
-                        'ok' => false,
-                        'rank' => $rank,
-                        'stage' => $this->stageResolver->rankToStage($rank),
-                        'error' => "Missing import for required stage {$this->stageResolver->rankToStage($rank)}.",
-                    ];
-                    break;
-                }
-
+            foreach ($planRanks as $rank) {
+                $importId = (int)$availableByRank[$rank];
                 $stage = $this->stageResolver->rankToStage($rank);
 
                 $res = $this->processImport($importId, $stage);
@@ -834,7 +845,7 @@ class InboundLoadMatchingService
                     break;
                 }
 
-                $currentRank = $rank;
+                $currentRank = max($currentRank, $rank);
             }
 
             $trace['ok'] = $groupOk;
@@ -911,10 +922,8 @@ class InboundLoadMatchingService
      * - do not append source/destination args during the test setup
      * - keep source path handling in existing BOL update flow
      */
-    private function applyDeliveredConfirmedImageImport(
-        int $importId,
-        array $bol
-    ): array {
+    private function applyDeliveredConfirmedImageImport(int $importId, array $bol): array
+    {
         $sourceBolPath = $this->str->strOrNull($bol['bol_path'] ?? null);
 
         $command = $this->getImageImportGrabberCommand();
@@ -983,8 +992,8 @@ class InboundLoadMatchingService
 
     /**
      * When DELIVERED_CONFIRMED is processed first and becomes the official record,
-     * mark the sibling imports for the same logical load as processed too, so the
-     * earlier stages appear processed and linked to the same load/load_detail.
+     * mark the sibling imports for the same join_id + load_number as processed too,
+     * so the earlier stages disappear from the queue.
      */
     private function syncDeliveredConfirmedChainTracking(
         int $currentImportId,
@@ -1005,25 +1014,17 @@ class InboundLoadMatchingService
             }
 
             $candidateParsed = $this->parser->parseImportRow($candidate);
-
             $candidateLoadNumber = $this->str->strOrNull($candidateParsed['load_number'] ?? null);
-            if ($candidateLoadNumber !== $targetLoadNumber) {
+            if (!$candidateLoadNumber || strcasecmp($candidateLoadNumber, $targetLoadNumber) !== 0) {
                 continue;
             }
 
-            $pp = $this->locationMatcher->matchPullPointByTerminal($candidateParsed['terminal'] ?? null);
-            $pl = $this->locationMatcher->matchPadLocationByJobname($candidateParsed['jobname'] ?? null);
-            $journey = $this->journeyResolver->buildJourney($pp, $pl);
-
-            $candidateJoinId = isset($journey['join_id']) && $journey['join_id']
-                ? (int)$journey['join_id']
+            $candidateJourney = $this->resolveJourneyForParsed($candidateParsed);
+            $candidateJoinId = isset($candidateJourney['join_id']) && $candidateJourney['join_id']
+                ? (int)$candidateJourney['join_id']
                 : null;
 
             if (!$candidateJoinId || $candidateJoinId !== $targetJoinId) {
-                continue;
-            }
-
-            if (!$this->isSameLogicalLoad($targetParsed, $candidateParsed)) {
                 continue;
             }
 
@@ -1039,6 +1040,54 @@ class InboundLoadMatchingService
 
             $this->tracker->updateTracking($candidateId, $idLoad, $idLoadDetail);
         }
+    }
+
+    private function resolveJourneyForParsed(array $parsed): array
+    {
+        $pp = $this->locationMatcher->matchPullPointByTerminal($parsed['terminal'] ?? null);
+        $pl = $this->locationMatcher->matchPadLocationByJobname($parsed['jobname'] ?? null);
+        return $this->journeyResolver->buildJourney($pp, $pl);
+    }
+
+    private function findBestImportsForGroup(int $joinId, string $loadNumber): array
+    {
+        $best = [];
+        $candidates = $this->findImportCandidatesByLoadNumber($loadNumber);
+
+        foreach ($candidates as $candidate) {
+            $candidateParsed = $this->parser->parseImportRow($candidate);
+            $candidateLoadNumber = $this->str->strOrNull($candidateParsed['load_number'] ?? null);
+
+            if (!$candidateLoadNumber || strcasecmp($candidateLoadNumber, $loadNumber) !== 0) {
+                continue;
+            }
+
+            $candidateJourney = $this->resolveJourneyForParsed($candidateParsed);
+            $candidateJoinId = isset($candidateJourney['join_id']) && $candidateJourney['join_id']
+                ? (int)$candidateJourney['join_id']
+                : null;
+
+            if (!$candidateJoinId || $candidateJoinId !== $joinId) {
+                continue;
+            }
+
+            $candidateStage = $this->stageResolver->determineStage(
+                $candidate->payload_json ?? null,
+                $candidateParsed['state'] ?? null
+            );
+
+            $rank = $this->stageResolver->stageRank($candidateStage);
+            if ($rank < 1 || $rank > 4) {
+                continue;
+            }
+
+            if (!isset($best[$rank]) || (int)$candidate->id > (int)$best[$rank]) {
+                $best[$rank] = (int)$candidate->id;
+            }
+        }
+
+        ksort($best);
+        return $best;
     }
 
     private function findImportCandidatesByLoadNumber(string $loadNumber): iterable
@@ -1076,25 +1125,5 @@ class InboundLoadMatchingService
         });
 
         return $q->orderBy('id')->get();
-    }
-
-    private function isSameLogicalLoad(array $targetParsed, array $candidateParsed): bool
-    {
-        $targetLoadNumber = $this->str->strOrNull($targetParsed['load_number'] ?? null);
-        $candidateLoadNumber = $this->str->strOrNull($candidateParsed['load_number'] ?? null);
-
-        if (!$targetLoadNumber || !$candidateLoadNumber) return false;
-        if (strcasecmp($targetLoadNumber, $candidateLoadNumber) !== 0) return false;
-
-        foreach (['jobname', 'terminal', 'truck_number', 'trailer_number'] as $key) {
-            $a = $this->str->strOrNull($targetParsed[$key] ?? null);
-            $b = $this->str->strOrNull($candidateParsed[$key] ?? null);
-
-            if ($a && $b && strcasecmp($a, $b) !== 0) {
-                return false;
-            }
-        }
-
-        return true;
     }
 }
