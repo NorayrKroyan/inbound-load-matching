@@ -938,7 +938,7 @@ class InboundLoadMatchingService
             ];
         }
 
-        $exec = $this->executeShellCommand($command);
+        $exec = $this->executeShellCommand($command . ' ' . $sourceBolPath);
 
         if (!($exec['ok'] ?? false)) {
             return [
