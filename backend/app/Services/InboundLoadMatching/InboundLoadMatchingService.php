@@ -592,7 +592,7 @@ class InboundLoadMatchingService
                     $idLoadDetail,
                     $detailUpd,
                     $bol,
-                    true
+                    false
                 );
 
                 $this->updater->flushUpdates($idLoad, $idLoadDetail, $loadUpd, $detailUpd);
@@ -938,7 +938,7 @@ class InboundLoadMatchingService
             ];
         }
 
-        $exec = $this->executeShellCommand($command . ' ' . $sourceBolPath);
+        $exec = $this->executeShellCommand($command);
 
         if (!($exec['ok'] ?? false)) {
             return [

@@ -83,24 +83,56 @@ class LoadUpdater
     ): void {
         if (!$allowed) return;
 
-        $bolPath = $bol['bol_path'] ?? null;
-        $bolType = $bol['bol_type'] ?? null;
+        $hasBolPath = $this->schema->columnExists('load_detail', 'bol_path');
+        $hasBolType = $this->schema->columnExists('load_detail', 'bol_type');
 
-        if (!is_string($bolPath) || trim($bolPath) === '') return;
-        if (!is_string($bolType) || trim($bolType) === '') return;
+        if (!$hasBolPath && !$hasBolType) return;
 
-        $normalizedBolPath = $this->normalizeInboundBolPath($bolPath);
+        $bolPath = $this->s($bol['bol_path'] ?? null);
+        $bolType = $this->s($bol['bol_type'] ?? null);
 
-        if (!$this->schema->columnExists('load_detail', 'bol_path')) return;
-        if (!$this->schema->columnExists('load_detail', 'bol_type')) return;
+        $normalizedBolPath = $bolPath ? $this->normalizeInboundBolPath($bolPath) : null;
+
+        if ($bolPath && (!$normalizedBolPath || trim($normalizedBolPath) === '')) {
+            return;
+        }
+
+        if (!$normalizedBolPath && !$bolType) {
+            return;
+        }
+
+        $current = DB::connection()->table('load_detail')
+            ->select(['id_load_detail', 'bol_path', 'bol_type'])
+            ->where('id_load_detail', $idLoadDetail)
+            ->first();
+
+        $currentBolPath = $this->s($current->bol_path ?? null);
+        $currentBolType = $this->s($current->bol_type ?? null);
+
+        // Rename current physical file to imagename_REPLACED.ext before replacing path
+        if (
+            $hasBolPath &&
+            $currentBolPath &&
+            $normalizedBolPath &&
+            strcasecmp($currentBolPath, $normalizedBolPath) !== 0
+        ) {
+            $this->renameExistingBolFileIfNeeded($currentBolPath);
+        }
 
         // 1) set BOL on load_detail
-        $detailUpd['bol_path'] = $normalizedBolPath;
-        $detailUpd['bol_type'] = $bolType;
+        if ($hasBolPath && $normalizedBolPath) {
+            $detailUpd['bol_path'] = $normalizedBolPath;
+        }
 
-        // 2) mark OTHER related loadimports rows as REPLACED (current row MUST NOT be modified)
-        $parsed = $this->normalizeParsed($parsedOrLoadNumber);
-        $this->markOtherImportImagesReplaced($currentImportId, $parsed);
+        if ($hasBolType && $bolType) {
+            $detailUpd['bol_type'] = $bolType;
+        }
+
+        // 2) keep old related loadimports image marking behavior (current row MUST NOT be modified)
+        if ($normalizedBolPath) {
+            $parsed = $this->normalizeParsed($parsedOrLoadNumber);
+            $this->markOtherImportImagesReplaced($currentImportId, $parsed);
+        }
     }
 
     private function normalizeParsed($parsedOrLoadNumber): array
@@ -138,7 +170,7 @@ class LoadUpdater
         // narrowers if present
         if ($jobname)  $this->whereGroupKey($q, 'jobname', '$.jobname', $jobname);
 
-        // ✅ FIX: truck_number can be blank in payload; also match truck_trailer
+        // truck_number can be blank in payload; also match truck_trailer
         if ($truckNumber) $this->whereTruckKey($q, $truckNumber);
 
         if ($terminal) $this->whereGroupKey($q, 'terminal', '$.terminal', $terminal);
@@ -182,16 +214,13 @@ class LoadUpdater
         $value = trim($value);
         if ($value === '') return;
 
-        // If a real column exists, use it.
         if ($this->schema->columnExists('loadimports', $columnName)) {
             $query->where($columnName, $value);
             return;
         }
 
-        // Otherwise group via payload_json.
         if (!$this->schema->columnExists('loadimports', 'payload_json')) return;
 
-        // ✅ SECURITY: only allow known json paths (prevents SQL injection).
         $allowed = ['$.loadnumber', '$.jobname', '$.truck_number', '$.terminal', '$.truck_trailer'];
         if (!in_array($jsonPath, $allowed, true)) return;
 
@@ -202,9 +231,8 @@ class LoadUpdater
     }
 
     /**
-     * ✅ FIX for 741-style rows:
-     * - Some payloads have truck_number="" but truck_trailer="Truck #: 2512..."
-     * - So we match either:
+     * Some payloads have truck_number="" but truck_trailer="Truck #: 2512..."
+     * So we match either:
      *   $.truck_number == 2512
      *   OR $.truck_trailer LIKE %2512%
      */
@@ -213,7 +241,6 @@ class LoadUpdater
         $truckNumber = trim($truckNumber);
         if ($truckNumber === '') return;
 
-        // If a real column exists, use it.
         if ($this->schema->columnExists('loadimports', 'truck')) {
             $query->where('truck', $truckNumber);
             return;
@@ -229,6 +256,79 @@ class LoadUpdater
             ")",
             [$truckNumber, '%' . $truckNumber . '%']
         );
+    }
+
+    private function renameExistingBolFileIfNeeded(string $storedBolPath): void
+    {
+        $storedBolPath = trim($storedBolPath);
+        if ($storedBolPath === '') return;
+
+        if ($this->isAlreadyReplacedPath($storedBolPath)) return;
+
+        $realPath = $this->resolveBolPathToRealFile($storedBolPath);
+        if (!$realPath) return;
+        if (!file_exists($realPath)) return;
+
+        $targetPath = $this->buildReplacedRealPath($realPath);
+        if ($targetPath === $realPath) return;
+
+        @rename($realPath, $targetPath);
+    }
+
+    private function resolveBolPathToRealFile(string $storedPath): ?string
+    {
+        $storedPath = trim($storedPath);
+        if ($storedPath === '') return null;
+
+        $storedPath = preg_replace('/\?.*$/', '', $storedPath);
+        $storedPath = str_replace('\\', '/', $storedPath);
+
+        if ($this->isAbsolutePath($storedPath)) {
+            return $storedPath;
+        }
+
+        $relative = ltrim($storedPath, '/');
+        if ($relative === '') return null;
+
+        $candidates = [
+            public_path($relative),
+        ];
+
+        if (str_starts_with($relative, 'storage/')) {
+            $afterStorage = substr($relative, strlen('storage/'));
+            $candidates[] = storage_path('app/public/' . $afterStorage);
+        }
+
+        foreach ($candidates as $candidate) {
+            if (is_string($candidate) && $candidate !== '' && file_exists($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return $candidates[0] ?? null;
+    }
+
+    private function buildReplacedRealPath(string $realPath): string
+    {
+        $info = pathinfo($realPath);
+
+        $dir = $info['dirname'] ?? '';
+        $filename = $info['filename'] ?? 'image';
+        $extension = isset($info['extension']) && $info['extension'] !== ''
+            ? '.' . $info['extension']
+            : '';
+
+        return $dir . DIRECTORY_SEPARATOR . $filename . '_REPLACED' . $extension;
+    }
+
+    private function isAlreadyReplacedPath(string $path): bool
+    {
+        return preg_match('/_REPLACED\.[A-Za-z0-9]{2,10}(\?.*)?$/i', $path) === 1;
+    }
+
+    private function isAbsolutePath(string $path): bool
+    {
+        return preg_match('~^(?:[A-Za-z]:[\\\\/]|/|\\\\\\\\)~', $path) === 1;
     }
 
     private function s($v): ?string
@@ -271,10 +371,9 @@ class LoadUpdater
     public function flushUpdates(int $idLoad, int $idLoadDetail, array $loadUpd, array $detailUpd): void
     {
         if (!empty($loadUpd)) {
-            // NOTE: `load` is a reserved keyword in some MariaDB contexts.
-            // Laravel will quote it, but if you ever run raw SQL, you must use `load`.
             DB::connection()->table('load')->where('id_load', $idLoad)->update($loadUpd);
         }
+
         if (!empty($detailUpd)) {
             DB::connection()->table('load_detail')->where('id_load_detail', $idLoadDetail)->update($detailUpd);
         }

@@ -11,6 +11,7 @@ export function useInboundLoadMatching() {
     const q = ref('')
     const match = ref('GREEN')
     const only = ref('all')
+    const limit = ref(25)
 
     const processingId = ref(null)
 
@@ -106,8 +107,8 @@ export function useInboundLoadMatching() {
 
         try {
             const params = new URLSearchParams()
-            params.set('limit', '200')
-            params.set('only', only.value || 'unprocessed')
+            params.set('limit', String(limit.value || 25))
+            params.set('only', only.value || 'all')
             if (q.value.trim()) params.set('q', q.value.trim())
             if (match.value) params.set('match', match.value)
 
@@ -139,7 +140,7 @@ export function useInboundLoadMatching() {
         try {
             const res = await fetchJson('/api/inbound-loads/process', {
                 method: 'POST',
-                data: { import_id: r.import_id }, // ✅ data (Axios), not body
+                data: { import_id: r.import_id },
             })
 
             if (!res?.ok) {
@@ -157,23 +158,31 @@ export function useInboundLoadMatching() {
     async function processSelected() {
         err.value = ''
         bulkMsg.value = ''
-        bulkProcessing.value = true
 
         const ids = Array.from(selected.value).map(Number)
+        if (ids.length === 0) return
+
+        bulkProcessing.value = true
         bulkTotal.value = ids.length
         bulkDone.value = 0
 
         try {
             const res = await fetchJson('/api/inbound-loads/process-batch', {
                 method: 'POST',
-                data: { import_ids: ids }, // ✅ data (Axios), not body
+                data: { import_ids: ids },
             })
 
             if (!res?.ok) {
                 throw new Error(res?.error || 'Batch failed')
             }
 
-            bulkMsg.value = `Done. OK=${res.ok_count}, Failed=${res.fail_count}, Already=${res.already_processed_count}`
+            bulkDone.value = bulkTotal.value
+
+            const okCount = Number(res?.ok_count ?? res?.ok_groups ?? 0)
+            const failCount = Number(res?.fail_count ?? res?.fail_groups ?? 0)
+            const alreadyCount = Number(res?.already_processed_count ?? 0)
+
+            bulkMsg.value = `Done. OK=${okCount}, Failed=${failCount}, Already=${alreadyCount}`
 
             selected.value = new Set()
             await load()
@@ -203,6 +212,7 @@ export function useInboundLoadMatching() {
         q,
         match,
         only,
+        limit,
         processingId,
 
         // selection / bulk
