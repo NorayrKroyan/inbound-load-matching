@@ -20,7 +20,7 @@
                 v-model="q"
                 class="h-10 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm outline-none ring-0 placeholder:text-slate-400 focus:border-slate-400"
                 placeholder="Driver / truck / job / terminal / load #"
-                @keydown.enter="load"
+                @keydown.enter="refreshQueue"
             />
           </div>
 
@@ -32,7 +32,7 @@
             <select
                 v-model="match"
                 class="h-10 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm outline-none focus:border-slate-400"
-                @change="load"
+                @change="refreshQueue"
             >
               <option value="">All</option>
               <option value="GREEN">GREEN</option>
@@ -49,7 +49,7 @@
             <select
                 v-model="only"
                 class="h-10 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm outline-none focus:border-slate-400"
-                @change="load"
+                @change="refreshQueue"
             >
               <option value="unprocessed">Unprocessed</option>
               <option value="processed">Processed</option>
@@ -70,7 +70,7 @@
               <option value="DELIVEREDCONFIRMED">DELIVERED-CONFIRMED</option>
               <option value="DELIVEREDPENDING">DELIVERED-PENDING</option>
               <option value="INTRANSIT">IN TRANSIT</option>
-              <option value="ATTERMINAL">ATTERMINAL</option>
+              <option value="ATTERMINAL">AT TERMINAL</option>
             </select>
           </div>
 
@@ -82,7 +82,7 @@
             <select
                 v-model.number="limit"
                 class="h-10 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm outline-none focus:border-slate-400"
-                @change="load"
+                @change="refreshQueue"
             >
               <option :value="25">25 loads</option>
               <option :value="50">50 loads</option>
@@ -96,7 +96,7 @@
               <button
                   class="h-10 rounded-xl border border-slate-900 bg-slate-950 px-3 text-sm font-medium text-white hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
                   :disabled="loading"
-                  @click="load"
+                  @click="refreshQueue"
               >
                 Refresh
               </button>
@@ -125,6 +125,28 @@
             class="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700"
         >
           {{ bulkMsg }}
+        </div>
+
+        <!-- Queue summary -->
+        <div class="mt-2 flex flex-wrap items-center gap-2">
+          <div class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+            Loaded: {{ queueCount }}
+          </div>
+
+          <div
+              v-if="visibleRecordCount !== queueCount"
+              class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700"
+          >
+            Visible: {{ visibleRecordCount }}
+          </div>
+
+          <div
+              v-for="item in statusSummary"
+              :key="item.key"
+              class="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700"
+          >
+            <span class="font-semibold">{{ item.label }}:</span> {{ item.count }}
+          </div>
         </div>
       </div>
     </div>
@@ -357,7 +379,7 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useInboundLoadMatching } from '../composables/useInboundLoadMatching'
 
 const {
@@ -373,6 +395,8 @@ const {
   bulkTotal,
   bulkDone,
   bulkMsg,
+  queueCount,
+  statusSummary,
   canProcess,
   isSelectable,
   isSelected,
@@ -382,7 +406,7 @@ const {
   processRow,
   processSelected,
   confidenceClasses,
-  journeyClasses
+  journeyClasses,
 } = useInboundLoadMatching()
 
 const statusFilter = ref('ALL')
@@ -396,7 +420,7 @@ function normalizeStatus(value) {
 const filteredRows = computed(() => {
   return (rows.value || []).filter((r) => {
     if (statusFilter.value === 'ALL') return true
-    return normalizeStatus(r.status_label || r.stage) === statusFilter.value
+    return normalizeStatus(r.status_label || r.stage || r.state) === statusFilter.value
   })
 })
 
@@ -405,13 +429,17 @@ const visibleEligibleRows = computed(() => {
 })
 
 const allVisibleEligibleSelected = computed(() => {
-  return visibleEligibleRows.value.length > 0 &&
+  return (
+      visibleEligibleRows.value.length > 0 &&
       visibleEligibleRows.value.every((r) => isSelected(r.import_id))
+  )
 })
 
 const someVisibleEligibleSelected = computed(() => {
   return visibleEligibleRows.value.some((r) => isSelected(r.import_id))
 })
+
+const visibleRecordCount = computed(() => filteredRows.value.length)
 
 function toggleSelectAllVisible(event) {
   const checked = !!event.target.checked
@@ -423,5 +451,11 @@ function toggleSelectAllVisible(event) {
   })
 }
 
-load()
+async function refreshQueue() {
+  await load()
+}
+
+onMounted(() => {
+  refreshQueue()
+})
 </script>

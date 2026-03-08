@@ -1,7 +1,42 @@
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 // ✅ Preferred (per doc): move your api helper to resources/js/api/http and import from there.
 // import { fetchJson } from '@/api/http'
 import { fetchJson } from '../utils/api'
+
+const LIMIT_STORAGE_KEY = 'inbound-load-matching-limit'
+const ALLOWED_LIMITS = [25, 50, 100]
+
+function normalizeLimit(value) {
+    const num = Number(value)
+    return ALLOWED_LIMITS.includes(num) ? num : 25
+}
+
+function readStoredLimit() {
+    if (typeof window === 'undefined') return 25
+    return normalizeLimit(window.localStorage.getItem(LIMIT_STORAGE_KEY))
+}
+
+function storeLimit(value) {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(LIMIT_STORAGE_KEY, String(normalizeLimit(value)))
+}
+
+function normalizeStatus(value) {
+    return String(value || '')
+        .toUpperCase()
+        .replace(/[\s\-_]/g, '')
+}
+
+function queueStatusKey(row) {
+    const key = normalizeStatus(row?.status_label || row?.stage || row?.state)
+
+    if (key === 'ATTERMINAL') return 'ATTERMINAL'
+    if (key === 'INTRANSIT') return 'INTRANSIT'
+    if (key === 'DELIVEREDPENDING') return 'DELIVEREDPENDING'
+    if (key === 'DELIVEREDCONFIRMED') return 'DELIVEREDCONFIRMED'
+
+    return 'OTHER'
+}
 
 export function useInboundLoadMatching() {
     const rows = ref([])
@@ -11,7 +46,7 @@ export function useInboundLoadMatching() {
     const q = ref('')
     const match = ref('GREEN')
     const only = ref('all')
-    const limit = ref(25)
+    const limit = ref(readStoredLimit())
 
     const processingId = ref(null)
 
@@ -23,6 +58,21 @@ export function useInboundLoadMatching() {
     const bulkTotal = ref(0)
     const bulkDone = ref(0)
     const bulkMsg = ref('')
+
+    watch(
+        limit,
+        (value) => {
+            const next = normalizeLimit(value)
+
+            if (Number(value) !== next) {
+                limit.value = next
+                return
+            }
+
+            storeLimit(next)
+        },
+        { immediate: true }
+    )
 
     function canProcess(r) {
         if (!r) return false
@@ -63,7 +113,7 @@ export function useInboundLoadMatching() {
     }
 
     const eligibleIds = computed(() =>
-        rows.value.filter(isSelectable).map(r => Number(r.import_id))
+        rows.value.filter(isSelectable).map((r) => Number(r.import_id))
     )
 
     const selectedCount = computed(() => selected.value.size)
@@ -81,11 +131,38 @@ export function useInboundLoadMatching() {
         return total > 0 && eligibleSelectedCount.value === total
     })
 
-    const someEligibleSelected = computed(
-        () =>
+    const someEligibleSelected = computed(() => {
+        return (
             eligibleSelectedCount.value > 0 &&
             eligibleSelectedCount.value < eligibleIds.value.length
-    )
+        )
+    })
+
+    const queueCount = computed(() => rows.value.length)
+
+    const statusCounts = computed(() => {
+        const counts = {
+            ATTERMINAL: 0,
+            INTRANSIT: 0,
+            DELIVEREDPENDING: 0,
+            DELIVEREDCONFIRMED: 0,
+            OTHER: 0,
+        }
+
+        for (const row of rows.value) {
+            counts[queueStatusKey(row)]++
+        }
+
+        return counts
+    })
+
+    const statusSummary = computed(() => [
+        { key: 'ATTERMINAL', label: 'AT TERMINAL', count: statusCounts.value.ATTERMINAL },
+        { key: 'INTRANSIT', label: 'IN TRANSIT', count: statusCounts.value.INTRANSIT },
+        { key: 'DELIVEREDPENDING', label: 'DELIVERED-PENDING', count: statusCounts.value.DELIVEREDPENDING },
+        { key: 'DELIVEREDCONFIRMED', label: 'DELIVERED-CONFIRMED', count: statusCounts.value.DELIVEREDCONFIRMED },
+        { key: 'OTHER', label: 'OTHER', count: statusCounts.value.OTHER },
+    ])
 
     function toggleSelectAllEligible(evt) {
         const checked = !!evt?.target?.checked
@@ -106,21 +183,37 @@ export function useInboundLoadMatching() {
         bulkMsg.value = ''
 
         try {
+            const safeLimit = normalizeLimit(limit.value)
+
+            if (limit.value !== safeLimit) {
+                limit.value = safeLimit
+            }
+
             const params = new URLSearchParams()
-            params.set('limit', String(limit.value || 25))
+            params.set('limit', String(safeLimit))
             params.set('only', only.value || 'all')
+
             if (q.value.trim()) params.set('q', q.value.trim())
             if (match.value) params.set('match', match.value)
 
             const res = await fetchJson(`/api/inbound-loads/queue?${params.toString()}`)
-            rows.value = res?.rows || []
 
-            // clean selection: keep only still-eligible IDs
+            rows.value = Array.isArray(res?.rows) ? res.rows : []
+
+            if (res?.limit !== undefined && res?.limit !== null && res?.limit !== '') {
+                limit.value = normalizeLimit(res.limit)
+            } else {
+                limit.value = safeLimit
+            }
+
+            // keep only currently eligible selected IDs
             const allowed = new Set(eligibleIds.value)
             const next = new Set()
+
             for (const id of selected.value) {
                 if (allowed.has(id)) next.add(id)
             }
+
             selected.value = next
         } catch (e) {
             err.value = e?.message || String(e)
@@ -226,6 +319,11 @@ export function useInboundLoadMatching() {
         eligibleSelectedCount,
         allEligibleSelected,
         someEligibleSelected,
+
+        // queue summary
+        queueCount,
+        statusCounts,
+        statusSummary,
 
         // behavior
         canProcess,
