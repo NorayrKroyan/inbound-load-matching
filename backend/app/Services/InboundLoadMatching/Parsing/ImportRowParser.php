@@ -12,14 +12,22 @@ class ImportRowParser
     {
         $data = [];
         $payloadJson = $r->payload_json ?? null;
+
         if ($payloadJson) {
             $decoded = json_decode($payloadJson, true);
-            if (is_array($decoded)) $data = $decoded;
+            if (is_array($decoded)) {
+                $data = $decoded;
+            }
         }
 
-        $jobname = $this->str->strOrNull($r->jobname ?? null) ?? $this->str->strOrNull($data['jobname'] ?? null);
-        $terminal = $this->str->strOrNull($r->terminal ?? null) ?? $this->str->strOrNull($data['terminal'] ?? null);
-        $state = $this->str->strOrNull($r->state ?? null) ?? $this->str->strOrNull($data['status'] ?? $data['state'] ?? null);
+        $jobname = $this->str->strOrNull($r->jobname ?? null)
+            ?? $this->str->strOrNull($data['jobname'] ?? null);
+
+        $terminal = $this->str->strOrNull($r->terminal ?? null)
+            ?? $this->str->strOrNull($data['terminal'] ?? null);
+
+        $state = $this->str->strOrNull($r->state ?? null)
+            ?? $this->str->strOrNull($data['status'] ?? $data['state'] ?? null);
 
         // delivery_time in parsed is only a fallback; DateResolver will prefer payload.datetime_delivered
         $deliveryTime =
@@ -35,7 +43,8 @@ class ImportRowParser
         $ticketNumber = $this->str->strOrNull($r->ticket_number ?? null)
             ?? $this->str->strOrNull($data['ticket_no'] ?? $data['ticket_number'] ?? null);
 
-        $carrierStr = $this->str->strOrNull($r->carrier ?? null) ?? $this->str->strOrNull($data['carrier'] ?? null);
+        $carrierStr = $this->str->strOrNull($r->carrier ?? null)
+            ?? $this->str->strOrNull($data['carrier'] ?? null);
 
         $truckStr =
             $this->str->strOrNull($r->truck ?? null)
@@ -45,10 +54,22 @@ class ImportRowParser
 
         $originalStr = $this->str->strOrNull($r->payload_original ?? null);
 
-        if (!$carrierStr && $originalStr) $carrierStr = $originalStr;
-        if (!$truckStr && $originalStr) $truckStr = $originalStr;
+        if (!$carrierStr && $originalStr) {
+            $carrierStr = $originalStr;
+        }
 
-        $driverName = $this->extractDriverName($carrierStr);
+        if (!$truckStr && $originalStr) {
+            $truckStr = $originalStr;
+        }
+
+        // NEW:
+        // Prefer explicit driver field first.
+        // Fallback to existing carrier parsing so old payloads continue to work.
+        $driverName =
+            $this->str->strOrNull($r->driver ?? null)
+            ?? $this->str->strOrNull($data['driver'] ?? null)
+            ?? $this->extractDriverName($carrierStr);
+
         $truckNumber = $this->extractTruckNumber($truckStr);
         $trailerNumber = $this->extractTrailerNumber($truckStr);
 
@@ -57,7 +78,9 @@ class ImportRowParser
             ?? $this->str->strOrNull($data['trailer'] ?? null)
             ?? $this->str->strOrNull($data['trailer_no'] ?? null);
 
-        if ($trailerExplicit) $trailerNumber = $trailerExplicit;
+        if ($trailerExplicit) {
+            $trailerNumber = $trailerExplicit;
+        }
 
         return [
             'driver_name' => $driverName,
@@ -79,12 +102,17 @@ class ImportRowParser
 
     private function extractDriverName(?string $carrier): ?string
     {
-        if (!$carrier) return null;
+        if (!$carrier) {
+            return null;
+        }
 
         $lines = preg_split("/\r\n|\n|\r/", $carrier);
+
         if (is_array($lines) && count($lines) >= 2) {
             $maybe = $this->str->strOrNull($lines[1]);
-            if ($maybe) return $maybe;
+            if ($maybe) {
+                return $maybe;
+            }
         }
 
         if (preg_match('/\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b/', $carrier, $m)) {
@@ -96,7 +124,9 @@ class ImportRowParser
 
     private function extractTruckNumber(?string $text): ?string
     {
-        if (!$text) return null;
+        if (!$text) {
+            return null;
+        }
 
         if (preg_match('/Truck\s*#?:?\s*([A-Za-z0-9]+)/i', $text, $m)) {
             return $this->str->strOrNull($m[1]);
@@ -116,7 +146,9 @@ class ImportRowParser
 
     private function extractTrailerNumber(?string $text): ?string
     {
-        if (!$text) return null;
+        if (!$text) {
+            return null;
+        }
 
         if (preg_match('/Trailer\s*#?:?\s*([A-Za-z0-9]+)/i', $text, $m)) {
             return $this->str->strOrNull($m[1]);

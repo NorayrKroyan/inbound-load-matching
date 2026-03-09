@@ -3,6 +3,7 @@
 namespace App\Services\InboundLoadMatching;
 
 use Throwable;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use App\Services\InboundLoadMatching\Support\DbSchema;
 use App\Services\InboundLoadMatching\Support\Str;
@@ -68,6 +69,177 @@ class InboundLoadMatchingService
     private LoadUpdater $updater;
     private LoadImportProcessLogger $processLogger;
 
+    public function getAutoProcessStatus(): array
+    {
+        $row = $this->ensureAutoProcessSettingsRow();
+
+        $lastResult = null;
+        if (!empty($row->last_result_json)) {
+            $decoded = json_decode($row->last_result_json, true);
+            $lastResult = is_array($decoded) ? $decoded : null;
+        }
+
+        return [
+            'ok' => true,
+            'enabled' => (bool)($row->is_enabled ?? 0),
+            'interval_minutes' => (int)($row->interval_minutes ?? 5),
+            'is_running' => (bool)($row->is_running ?? 0),
+            'last_started_at' => $row->last_started_at ?? null,
+            'last_finished_at' => $row->last_finished_at ?? null,
+            'last_result' => $lastResult,
+        ];
+    }
+
+    public function startAutoProcess(int $intervalMinutes = 5): array
+    {
+        $intervalMinutes = max(1, min(60, $intervalMinutes));
+        $this->ensureAutoProcessSettingsRow();
+
+        DB::connection()->table('loadimport_autoprocess_settings')
+            ->where('id', 1)
+            ->update([
+                'is_enabled' => 1,
+                'interval_minutes' => $intervalMinutes,
+                'updated_at' => now(),
+            ]);
+
+        return $this->getAutoProcessStatus();
+    }
+
+    public function stopAutoProcess(): array
+    {
+        $this->ensureAutoProcessSettingsRow();
+
+        DB::connection()->table('loadimport_autoprocess_settings')
+            ->where('id', 1)
+            ->update([
+                'is_enabled' => 0,
+                'updated_at' => now(),
+            ]);
+
+        return $this->getAutoProcessStatus();
+    }
+
+    public function runAutoProcessTick(): array
+    {
+        $gate = DB::connection()->transaction(function () {
+            $row = DB::connection()
+                ->table('loadimport_autoprocess_settings')
+                ->where('id', 1)
+                ->lockForUpdate()
+                ->first();
+
+            if (!$row) {
+                DB::connection()->table('loadimport_autoprocess_settings')->insert([
+                    'id' => 1,
+                    'is_enabled' => 0,
+                    'interval_minutes' => 5,
+                    'is_running' => 0,
+                    'last_started_at' => null,
+                    'last_finished_at' => null,
+                    'last_result_json' => null,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+
+                $row = DB::connection()
+                    ->table('loadimport_autoprocess_settings')
+                    ->where('id', 1)
+                    ->lockForUpdate()
+                    ->first();
+            }
+
+            if (!(int)$row->is_enabled) {
+                return [
+                    'should_run' => false,
+                    'reason' => 'disabled',
+                ];
+            }
+
+            if ((int)$row->is_running === 1) {
+                return [
+                    'should_run' => false,
+                    'reason' => 'already_running',
+                ];
+            }
+
+            $intervalMinutes = max(1, (int)($row->interval_minutes ?? 5));
+            $lastStartedAt = !empty($row->last_started_at)
+                ? Carbon::parse($row->last_started_at)
+                : null;
+
+            if ($lastStartedAt) {
+                $nextDueAt = $lastStartedAt->copy()->addMinutes($intervalMinutes);
+
+                if (now()->lt($nextDueAt)) {
+                    return [
+                        'should_run' => false,
+                        'reason' => 'not_due',
+                        'next_due_at' => $nextDueAt->toDateTimeString(),
+                    ];
+                }
+            }
+
+            DB::connection()->table('loadimport_autoprocess_settings')
+                ->where('id', 1)
+                ->update([
+                    'is_running' => 1,
+                    'last_started_at' => now(),
+                    'updated_at' => now(),
+                ]);
+
+            return [
+                'should_run' => true,
+                'interval_minutes' => $intervalMinutes,
+            ];
+        });
+
+        if (!($gate['should_run'] ?? false)) {
+            return [
+                'ok' => true,
+                'skipped' => true,
+                'reason' => $gate['reason'] ?? 'unknown',
+                'next_due_at' => $gate['next_due_at'] ?? null,
+            ];
+        }
+
+        $candidateIds = [];
+        $result = null;
+
+        try {
+            $candidateIds = $this->findAutoProcessCandidateIds();
+
+            if (count($candidateIds) === 0) {
+                $result = [
+                    'ok' => true,
+                    'skipped' => true,
+                    'reason' => 'no_candidates',
+                    'candidate_ids' => [],
+                ];
+            } else {
+                $result = $this->processAutoWithLogging($candidateIds);
+                $result['candidate_ids'] = $candidateIds;
+            }
+        } catch (Throwable $e) {
+            $result = [
+                'ok' => false,
+                'error' => $e->getMessage(),
+                'candidate_ids' => $candidateIds,
+            ];
+        } finally {
+            DB::connection()->table('loadimport_autoprocess_settings')
+                ->where('id', 1)
+                ->update([
+                    'is_running' => 0,
+                    'last_finished_at' => now(),
+                    'last_result_json' => json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+                    'updated_at' => now(),
+                ]);
+        }
+
+        return $result;
+    }
+
     public function buildQueue(int $limit, string $only, string $q, string $matchFilter): array
     {
         $select = ['id', 'jobname', 'payload_json', 'payload_original', 'created_at', 'updated_at'];
@@ -104,6 +276,8 @@ class InboundLoadMatchingService
 
             $liIsInserted = property_exists($r, 'is_inserted') ? (int)($r->is_inserted ?? 0) : 0;
             $liIdLoad = property_exists($r, 'id_load') ? ($r->id_load !== null ? (int)$r->id_load : null) : null;
+            $liIdLoadDetail = property_exists($r, 'id_load_detail') ? ($r->id_load_detail !== null ? (int)$r->id_load_detail : null) : null;
+            $liInsertedAt = property_exists($r, 'inserted_at') ? ($r->inserted_at ?? null) : null;
 
             $isProcessed = ($processedDetail ? true : false) || ($liIsInserted === 1) || ($liIdLoad !== null);
 
@@ -181,13 +355,18 @@ class InboundLoadMatchingService
                 'raw_truck' => $parsed['raw_truck'],
                 'raw_original' => $parsed['raw_original'],
 
+                'is_inserted' => ($liIsInserted === 1),
+                'import_load_id' => $liIdLoad,
+                'import_load_detail_id' => $liIdLoadDetail,
+                'inserted_at' => $liInsertedAt,
+
                 'is_processed' => $isProcessed,
                 'processed_load_id' => $processedDetail?->id_load
                     ? (int)$processedDetail->id_load
-                    : (property_exists($r, 'id_load') ? ($r->id_load !== null ? (int)$r->id_load : null) : null),
+                    : $liIdLoad,
                 'processed_load_detail_id' => $processedDetail?->id_load_detail
                     ? (int)$processedDetail->id_load_detail
-                    : (property_exists($r, 'id_load_detail') ? ($r->id_load_detail !== null ? (int)$r->id_load_detail : null) : null),
+                    : $liIdLoadDetail,
 
                 'match' => [
                     'confidence' => $confidence,
@@ -1301,9 +1480,29 @@ class InboundLoadMatchingService
      * - do not append source/destination args during the test setup
      * - keep source path handling in existing BOL update flow
      */
+    /**
+     * IMAGE_IMPORT_GRABBER contract:
+     * - .env contains the base command (and may include a fixed first arg for local wrappers)
+     * - PHP always appends the runtime source relative path as the final argument
+     * - production example:
+     *     /var/www/html/OOPS/voldchat/movefromapi.sh <relative-path-under-loadimports>
+     * - local example:
+     *     cmd /c C:\tmp\image_import_grabber_test.bat "C:\tmp\test destination.jpg" <relative-path-under-loadimports>
+     */
     private function applyDeliveredConfirmedImageImport(int $importId, array $bol): array
     {
         $sourceBolPath = $this->str->strOrNull($bol['bol_path'] ?? null);
+        $bolType = $this->str->strOrNull($bol['bol_type'] ?? null);
+
+        if (!$sourceBolPath) {
+            return [
+                'ok' => true,
+                'skipped' => true,
+                'reason' => 'No BOL source path available for IMAGE_IMPORT_GRABBER.',
+                'source_path' => null,
+                'bol_type' => $bolType,
+            ];
+        }
 
         $command = $this->getImageImportGrabberCommand();
         if (!$command) {
@@ -1312,31 +1511,71 @@ class InboundLoadMatchingService
                 'skipped' => false,
                 'error' => 'IMAGE_IMPORT_GRABBER is not configured.',
                 'source_path' => $sourceBolPath,
+                'bol_type' => $bolType,
             ];
         }
 
-        $exec = $this->executeShellCommand($command);
+        try {
+            $normalizedSourcePath = $this->normalizeGrabberRelativePath($sourceBolPath);
+        } catch (Throwable $e) {
+            return [
+                'ok' => false,
+                'skipped' => false,
+                'error' => 'Invalid IMAGE_IMPORT_GRABBER source path for import_id=' . $importId . '. ' . $e->getMessage(),
+                'source_path' => $sourceBolPath,
+                'bol_type' => $bolType,
+            ];
+        }
+
+        $finalCommand = $command . ' ' . escapeshellarg($normalizedSourcePath);
+        $exec = $this->executeShellCommand($finalCommand);
 
         if (!($exec['ok'] ?? false)) {
             return [
                 'ok' => false,
                 'skipped' => false,
                 'error' => 'IMAGE_IMPORT_GRABBER failed for import_id=' . $importId . '. ' . ($exec['error'] ?? 'Unknown shell error.'),
-                'command' => $command,
+                'command' => $finalCommand,
                 'output' => $exec['output'] ?? [],
                 'exit_code' => $exec['exit_code'] ?? null,
-                'source_path' => $sourceBolPath,
+                'source_path' => $normalizedSourcePath,
+                'bol_type' => $bolType,
             ];
         }
 
         return [
             'ok' => true,
             'skipped' => false,
-            'command' => $command,
-            'source_path' => $sourceBolPath,
+            'command' => $finalCommand,
+            'source_path' => $normalizedSourcePath,
             'output' => $exec['output'] ?? [],
-            'bol_type' => $this->str->strOrNull($bol['bol_type'] ?? null),
+            'bol_type' => $bolType,
         ];
+    }
+
+    private function normalizeGrabberRelativePath(?string $path): string
+    {
+        $path = trim((string)$path);
+        $path = str_replace('\\', '/', $path);
+        $path = ltrim($path, '/');
+
+        if ($path === '') {
+            throw new \RuntimeException('Source path is empty.');
+        }
+
+        if (preg_match('/^[A-Za-z]:[\/\\\\]/', $path)) {
+            throw new \RuntimeException('Absolute Windows path given; relative path expected.');
+        }
+
+        if (str_starts_with($path, '\\')) {
+            throw new \RuntimeException('UNC/absolute path given; relative path expected.');
+        }
+
+        if (str_contains($path, '..')) {
+            throw new \RuntimeException('Parent directory traversal is not allowed.');
+        }
+
+        return $path;
     }
 
     private function getImageImportGrabberCommand(): ?string
@@ -1467,6 +1706,84 @@ class InboundLoadMatchingService
 
         ksort($best);
         return $best;
+    }
+
+    private function findAutoProcessCandidateIds(): array
+    {
+        $queue = $this->buildQueue(3000, 'unprocessed', '', '');
+        $bestByGroup = [];
+
+        foreach ($queue as $row) {
+            if (($row['stage'] ?? null) !== StageResolver::STAGE_DELIVERED_CONFIRMED) {
+                continue;
+            }
+
+            if (!empty($row['is_processed']) || !empty($row['is_inserted'])) {
+                continue;
+            }
+
+            $confidence = $row['match']['confidence'] ?? null;
+            if ($confidence !== 'GREEN') {
+                continue;
+            }
+
+            $resolvedDriver = $row['match']['driver']['resolved'] ?? null;
+            if (!$resolvedDriver || empty($resolvedDriver['id_driver']) || empty($resolvedDriver['id_carrier'])) {
+                continue;
+            }
+
+            $journey = $row['match']['journey'] ?? [];
+            if (($journey['status'] ?? '') !== 'READY') {
+                continue;
+            }
+
+            $joinId = (int)($journey['join_id'] ?? 0);
+            $loadNumber = $this->str->strOrNull($row['load_number'] ?? null);
+            $importId = (int)($row['import_id'] ?? 0);
+
+            if ($joinId <= 0 || !$loadNumber || $importId <= 0) {
+                continue;
+            }
+
+            $groupKey = $joinId . '|' . $loadNumber;
+            if (!isset($bestByGroup[$groupKey]) || $importId > $bestByGroup[$groupKey]) {
+                $bestByGroup[$groupKey] = $importId;
+            }
+        }
+
+        $ids = array_values($bestByGroup);
+        rsort($ids);
+
+        return $ids;
+    }
+
+    private function ensureAutoProcessSettingsRow(): object
+    {
+        $row = DB::connection()
+            ->table('loadimport_autoprocess_settings')
+            ->where('id', 1)
+            ->first();
+
+        if ($row) {
+            return $row;
+        }
+
+        DB::connection()->table('loadimport_autoprocess_settings')->insert([
+            'id' => 1,
+            'is_enabled' => 0,
+            'interval_minutes' => 5,
+            'is_running' => 0,
+            'last_started_at' => null,
+            'last_finished_at' => null,
+            'last_result_json' => null,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        return DB::connection()
+            ->table('loadimport_autoprocess_settings')
+            ->where('id', 1)
+            ->first();
     }
 
     private function findImportCandidatesByLoadNumber(string $loadNumber): iterable

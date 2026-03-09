@@ -79,6 +79,26 @@ class InboundLoadMatchingController extends Controller
         return response()->json($res, 200);
     }
 
+    public function autoProcessStatus(InboundLoadMatchingService $svc)
+    {
+        return response()->json($svc->getAutoProcessStatus());
+    }
+
+    public function autoProcessStart(Request $request, InboundLoadMatchingService $svc)
+    {
+        $intervalMinutes = (int)$request->input('interval_minutes', 5);
+        $res = $svc->startAutoProcess($intervalMinutes);
+
+        return response()->json($res, 200);
+    }
+
+    public function autoProcessStop(InboundLoadMatchingService $svc)
+    {
+        $res = $svc->stopAutoProcess();
+
+        return response()->json($res, 200);
+    }
+
     public function logs(Request $request)
     {
         $limit = (int)($request->query('limit', 200));

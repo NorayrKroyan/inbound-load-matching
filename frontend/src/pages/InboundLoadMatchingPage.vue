@@ -10,6 +10,121 @@
 
       <!-- Compact Controls -->
       <div class="w-full xl:max-w-[980px]">
+        <!-- Autoprocess header row -->
+        <div class="mb-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+          <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div class="flex items-center gap-3">
+              <label
+                  for="autoprocess_switch"
+                  class="text-[11px] font-semibold uppercase tracking-wide text-slate-500"
+              >
+                Auto Process
+              </label>
+
+              <ToggleSwitch
+                  inputId="autoprocess_switch"
+                  :modelValue="autoUiEnabled"
+                  :disabled="autoSyncing || bulkProcessing || loading"
+                  @update:modelValue="handleAutoToggle"
+              />
+
+              <span
+                  class="inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-bold"
+                  :class="autoModeClasses"
+              >
+                {{ autoUiEnabled ? 'ON' : 'OFF' }}
+              </span>
+
+              <span
+                  v-if="autoIsRunning"
+                  class="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-bold text-sky-800"
+              >
+                RUNNING
+              </span>
+            </div>
+
+            <div class="text-xs text-slate-500">
+              Backend scheduler is controlled here. Processing itself is not run in the browser.
+            </div>
+          </div>
+
+          <div
+              v-if="autoPanelVisible"
+              class="mt-2 rounded-xl border border-slate-200 bg-white p-3"
+          >
+            <div class="grid grid-cols-1 gap-2 md:grid-cols-4">
+              <div>
+                <label class="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  Interval
+                </label>
+                <select
+                    v-model.number="autoUiInterval"
+                    class="h-10 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm outline-none focus:border-slate-400"
+                    :disabled="autoSyncing || autoIsRunning"
+                    @change="applyAutoInterval"
+                >
+                  <option :value="1">Every 1 minute</option>
+                  <option :value="5">Every 5 minutes</option>
+                  <option :value="10">Every 10 minutes</option>
+                  <option :value="15">Every 15 minutes</option>
+                  <option :value="30">Every 30 minutes</option>
+                  <option :value="60">Every 60 minutes</option>
+                </select>
+              </div>
+
+              <div class="flex items-end">
+                <button
+                    class="h-10 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm font-medium text-slate-900 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    :disabled="autoSyncing"
+                    @click="syncAutoStatus"
+                >
+                  Sync Auto Status
+                </button>
+              </div>
+
+              <div class="flex items-end">
+                <div class="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                  <div class="font-semibold">Last start</div>
+                  <div class="mt-1 font-mono">{{ autoLastStartedAt || '—' }}</div>
+                </div>
+              </div>
+
+              <div class="flex items-end">
+                <div class="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+                  <div class="font-semibold">Last finish</div>
+                  <div class="mt-1 font-mono">{{ autoLastFinishedAt || '—' }}</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="mt-2 flex flex-wrap items-center gap-2">
+              <div
+                  class="rounded-full border px-3 py-1 text-xs font-semibold"
+                  :class="autoBackendStatusClasses"
+              >
+                Backend: {{ autoIsRunning ? 'RUNNING' : (autoUiEnabled ? 'ENABLED' : 'DISABLED') }}
+              </div>
+
+              <div class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+                Interval: {{ autoUiInterval }} min
+              </div>
+
+              <div
+                  v-if="autoLastResult && autoLastResult.candidate_ids"
+                  class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700"
+              >
+                Candidates: {{ autoLastResult.candidate_ids.length }}
+              </div>
+            </div>
+
+            <div
+                class="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700"
+            >
+              {{ autoLastResultSummary }}
+            </div>
+          </div>
+        </div>
+
         <div class="grid grid-cols-1 gap-x-2 gap-y-1 sm:grid-cols-2 lg:grid-cols-6">
           <!-- Search -->
           <div class="lg:col-span-2">
@@ -379,7 +494,8 @@
 </template>
 
 <script setup>
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue'
+import ToggleSwitch from 'primevue/toggleswitch'
 import { useInboundLoadMatching } from '../composables/useInboundLoadMatching'
 
 const {
@@ -407,9 +523,25 @@ const {
   processSelected,
   confidenceClasses,
   journeyClasses,
+
+  autoEnabled,
+  autoIntervalMinutes,
+  autoIsRunning,
+  autoLastStartedAt,
+  autoLastFinishedAt,
+  autoLastResult,
+  loadAutoProcessStatus,
+  startAutoProcess,
+  stopAutoProcess,
 } = useInboundLoadMatching()
 
 const statusFilter = ref('ALL')
+
+const autoUiEnabled = ref(false)
+const autoUiInterval = ref(5)
+const autoSyncing = ref(false)
+
+let autoStatusTimer = null
 
 function normalizeStatus(value) {
   return String(value || '')
@@ -441,6 +573,58 @@ const someVisibleEligibleSelected = computed(() => {
 
 const visibleRecordCount = computed(() => filteredRows.value.length)
 
+const autoPanelVisible = computed(() => autoUiEnabled.value || autoIsRunning.value)
+
+const autoModeClasses = computed(() => {
+  if (autoUiEnabled.value) {
+    return 'border-emerald-200 bg-emerald-50 text-emerald-800'
+  }
+
+  return 'border-slate-200 bg-slate-100 text-slate-700'
+})
+
+const autoBackendStatusClasses = computed(() => {
+  if (autoIsRunning.value) {
+    return 'border-sky-200 bg-sky-50 text-sky-800'
+  }
+
+  if (autoUiEnabled.value) {
+    return 'border-emerald-200 bg-emerald-50 text-emerald-800'
+  }
+
+  return 'border-slate-200 bg-slate-50 text-slate-700'
+})
+
+const autoLastResultSummary = computed(() => {
+  const result = autoLastResult.value
+
+  if (!result) {
+    return 'No auto-process run has been recorded yet.'
+  }
+
+  if (result.skipped && result.reason === 'no_candidates') {
+    return 'Last auto run: no eligible DELIVERED-CONFIRMED groups were found.'
+  }
+
+  if (result.skipped) {
+    return `Last auto run skipped: ${result.reason || 'unknown'}`
+  }
+
+  if (result.ok === false && result.error) {
+    return `Last auto run failed: ${result.error}`
+  }
+
+  const groups = Number(result.groups ?? 0)
+  const okGroups = Number(result.ok_groups ?? 0)
+  const failGroups = Number(result.fail_groups ?? 0)
+
+  if (groups || okGroups || failGroups) {
+    return `Last auto run finished. Groups=${groups}, OK=${okGroups}, Failed=${failGroups}`
+  }
+
+  return 'Last auto run finished.'
+})
+
 function toggleSelectAllVisible(event) {
   const checked = !!event.target.checked
 
@@ -455,7 +639,89 @@ async function refreshQueue() {
   await load()
 }
 
-onMounted(() => {
-  refreshQueue()
+async function syncAutoStatus() {
+  const res = await loadAutoProcessStatus()
+  autoUiEnabled.value = !!autoEnabled.value
+  autoUiInterval.value = Number(autoIntervalMinutes.value || 5)
+  return res
+}
+
+function stopAutoPolling() {
+  if (autoStatusTimer) {
+    clearInterval(autoStatusTimer)
+    autoStatusTimer = null
+  }
+}
+
+function startAutoPolling() {
+  if (autoStatusTimer) return
+
+  autoStatusTimer = setInterval(async () => {
+    if (!autoUiEnabled.value && !autoIsRunning.value) {
+      stopAutoPolling()
+      return
+    }
+
+    try {
+      await syncAutoStatus()
+    } catch (_) {
+      // silent polling failure
+    }
+  }, 15000)
+}
+
+watch(
+    () => [autoUiEnabled.value, autoIsRunning.value],
+    ([enabled, running]) => {
+      if (enabled || running) {
+        startAutoPolling()
+      } else {
+        stopAutoPolling()
+      }
+    },
+    { immediate: true }
+)
+
+async function handleAutoToggle(nextValue) {
+  autoSyncing.value = true
+
+  try {
+    if (nextValue) {
+      autoUiEnabled.value = true
+      await startAutoProcess(autoUiInterval.value)
+      await syncAutoStatus()
+      startAutoPolling()
+    } else {
+      await stopAutoProcess()
+      await syncAutoStatus()
+      stopAutoPolling()
+    }
+  } catch (e) {
+    await syncAutoStatus().catch(() => {})
+  } finally {
+    autoSyncing.value = false
+  }
+}
+
+async function applyAutoInterval() {
+  if (!autoUiEnabled.value) return
+
+  autoSyncing.value = true
+
+  try {
+    await startAutoProcess(autoUiInterval.value)
+    await syncAutoStatus()
+  } finally {
+    autoSyncing.value = false
+  }
+}
+
+onMounted(async () => {
+  await refreshQueue()
+  await syncAutoStatus()
+})
+
+onBeforeUnmount(() => {
+  stopAutoPolling()
 })
 </script>

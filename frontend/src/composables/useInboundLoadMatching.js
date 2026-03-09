@@ -1,10 +1,9 @@
 import { ref, computed, watch } from 'vue'
-// ✅ Preferred (per doc): move your api helper to resources/js/api/http and import from there.
-// import { fetchJson } from '@/api/http'
 import { fetchJson } from '../utils/api'
 
 const LIMIT_STORAGE_KEY = 'inbound-load-matching-limit'
 const ALLOWED_LIMITS = [25, 50, 100]
+const AUTO_ALLOWED_INTERVALS = [1, 5, 10, 15, 30, 60]
 
 function normalizeLimit(value) {
     const num = Number(value)
@@ -19,6 +18,11 @@ function readStoredLimit() {
 function storeLimit(value) {
     if (typeof window === 'undefined') return
     window.localStorage.setItem(LIMIT_STORAGE_KEY, String(normalizeLimit(value)))
+}
+
+function normalizeAutoInterval(value) {
+    const num = Number(value)
+    return AUTO_ALLOWED_INTERVALS.includes(num) ? num : 5
 }
 
 function normalizeStatus(value) {
@@ -50,14 +54,20 @@ export function useInboundLoadMatching() {
 
     const processingId = ref(null)
 
-    // selection
     const selected = ref(new Set())
 
-    // bulk
     const bulkProcessing = ref(false)
     const bulkTotal = ref(0)
     const bulkDone = ref(0)
     const bulkMsg = ref('')
+
+    const autoBusy = ref(false)
+    const autoEnabled = ref(false)
+    const autoIntervalMinutes = ref(5)
+    const autoIsRunning = ref(false)
+    const autoLastStartedAt = ref(null)
+    const autoLastFinishedAt = ref(null)
+    const autoLastResult = ref(null)
 
     watch(
         limit,
@@ -177,6 +187,71 @@ export function useInboundLoadMatching() {
         selected.value = next
     }
 
+    function applyAutoStatusPayload(data) {
+        autoEnabled.value = !!data?.enabled
+        autoIntervalMinutes.value = normalizeAutoInterval(data?.interval_minutes)
+        autoIsRunning.value = !!data?.is_running
+        autoLastStartedAt.value = data?.last_started_at || null
+        autoLastFinishedAt.value = data?.last_finished_at || null
+        autoLastResult.value = data?.last_result || null
+        return data
+    }
+
+    async function loadAutoProcessStatus() {
+        try {
+            const res = await fetchJson('/api/inbound-loads/autoprocess/status', {
+                method: 'GET',
+            })
+
+            return applyAutoStatusPayload(res || {})
+        } catch (e) {
+            err.value = e?.message || String(e)
+            throw e
+        }
+    }
+
+    async function startAutoProcess(intervalMinutes = autoIntervalMinutes.value) {
+        err.value = ''
+        autoBusy.value = true
+
+        try {
+            const safeInterval = normalizeAutoInterval(intervalMinutes)
+
+            const res = await fetchJson('/api/inbound-loads/autoprocess/start', {
+                method: 'POST',
+                data: {
+                    interval_minutes: safeInterval,
+                },
+            })
+
+            return applyAutoStatusPayload(res || {})
+        } catch (e) {
+            err.value = e?.message || String(e)
+            throw e
+        } finally {
+            autoBusy.value = false
+        }
+    }
+
+    async function stopAutoProcess() {
+        err.value = ''
+        autoBusy.value = true
+
+        try {
+            const res = await fetchJson('/api/inbound-loads/autoprocess/stop', {
+                method: 'POST',
+                data: {},
+            })
+
+            return applyAutoStatusPayload(res || {})
+        } catch (e) {
+            err.value = e?.message || String(e)
+            throw e
+        } finally {
+            autoBusy.value = false
+        }
+    }
+
     async function load() {
         err.value = ''
         loading.value = true
@@ -206,7 +281,6 @@ export function useInboundLoadMatching() {
                 limit.value = safeLimit
             }
 
-            // keep only currently eligible selected IDs
             const allowed = new Set(eligibleIds.value)
             const next = new Set()
 
@@ -241,6 +315,7 @@ export function useInboundLoadMatching() {
             }
 
             await load()
+            await loadAutoProcessStatus().catch(() => {})
         } catch (e) {
             err.value = e?.message || String(e)
         } finally {
@@ -279,6 +354,7 @@ export function useInboundLoadMatching() {
 
             selected.value = new Set()
             await load()
+            await loadAutoProcessStatus().catch(() => {})
         } catch (e) {
             err.value = e?.message || String(e)
         } finally {
@@ -308,7 +384,6 @@ export function useInboundLoadMatching() {
         limit,
         processingId,
 
-        // selection / bulk
         selected,
         bulkProcessing,
         bulkTotal,
@@ -320,12 +395,21 @@ export function useInboundLoadMatching() {
         allEligibleSelected,
         someEligibleSelected,
 
-        // queue summary
         queueCount,
         statusCounts,
         statusSummary,
 
-        // behavior
+        autoBusy,
+        autoEnabled,
+        autoIntervalMinutes,
+        autoIsRunning,
+        autoLastStartedAt,
+        autoLastFinishedAt,
+        autoLastResult,
+        loadAutoProcessStatus,
+        startAutoProcess,
+        stopAutoProcess,
+
         canProcess,
         isSelectable,
         isSelected,
@@ -335,7 +419,6 @@ export function useInboundLoadMatching() {
         processRow,
         processSelected,
 
-        // UI class helpers
         journeyClasses,
         confidenceClasses,
     }
