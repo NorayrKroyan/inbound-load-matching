@@ -11,8 +11,8 @@ class ImportRowParser
     public function parseImportRow(object $r): array
     {
         $data = [];
-        $payloadJson = $r->payload_json ?? null;
 
+        $payloadJson = $r->payload_json ?? null;
         if ($payloadJson) {
             $decoded = json_decode($payloadJson, true);
             if (is_array($decoded)) {
@@ -29,7 +29,6 @@ class ImportRowParser
         $state = $this->str->strOrNull($r->state ?? null)
             ?? $this->str->strOrNull($data['status'] ?? $data['state'] ?? null);
 
-        // delivery_time in parsed is only a fallback; DateResolver will prefer payload.datetime_delivered
         $deliveryTime =
             $this->str->strOrNull($r->delivery_time ?? null)
             ?? $this->str->strOrNull($data['delivery_time'] ?? null)
@@ -62,9 +61,6 @@ class ImportRowParser
             $truckStr = $originalStr;
         }
 
-        // NEW:
-        // Prefer explicit driver field first.
-        // Fallback to existing carrier parsing so old payloads continue to work.
         $driverName =
             $this->str->strOrNull($r->driver ?? null)
             ?? $this->str->strOrNull($data['driver'] ?? null)
@@ -86,14 +82,12 @@ class ImportRowParser
             'driver_name' => $driverName,
             'truck_number' => $truckNumber,
             'trailer_number' => $trailerNumber,
-
             'jobname' => $this->str->strOrNull($jobname),
             'terminal' => $this->str->strOrNull($terminal),
             'load_number' => $loadNumber,
             'ticket_number' => $ticketNumber,
             'state' => $state,
             'delivery_time' => $deliveryTime,
-
             'raw_carrier' => $carrierStr,
             'raw_truck' => $truckStr,
             'raw_original' => $originalStr,
@@ -107,9 +101,9 @@ class ImportRowParser
         }
 
         $lines = preg_split("/\r\n|\n|\r/", $carrier);
-
         if (is_array($lines) && count($lines) >= 2) {
             $maybe = $this->str->strOrNull($lines[1]);
+
             if ($maybe) {
                 return $maybe;
             }
@@ -128,16 +122,16 @@ class ImportRowParser
             return null;
         }
 
-        if (preg_match('/Truck\s*#?:?\s*([A-Za-z0-9]+)/i', $text, $m)) {
+        if (preg_match('/Truck\s*#?:?\s*([A-Za-z0-9-]+)/i', $text, $m)) {
             return $this->str->strOrNull($m[1]);
         }
 
-        if (preg_match('/^\s*([A-Za-z0-9]+)\s*[\/\-]\s*([A-Za-z0-9]+)\s*$/', trim($text), $m)) {
+        if (preg_match('/^\s*([A-Za-z0-9-]+)\s*[\/]\s*([A-Za-z0-9-]+)\s*$/', trim($text), $m)) {
             return $this->str->strOrNull($m[1]);
         }
 
         $t = trim($text);
-        if ($t !== '' && preg_match('/^[A-Za-z0-9]+$/', $t)) {
+        if ($t !== '' && preg_match('/^[A-Za-z0-9-]+$/', $t)) {
             return $this->str->strOrNull($t);
         }
 
@@ -150,11 +144,11 @@ class ImportRowParser
             return null;
         }
 
-        if (preg_match('/Trailer\s*#?:?\s*([A-Za-z0-9]+)/i', $text, $m)) {
+        if (preg_match('/Trailer\s*#?:?\s*([A-Za-z0-9-]+)/i', $text, $m)) {
             return $this->str->strOrNull($m[1]);
         }
 
-        if (preg_match('/^\s*([A-Za-z0-9]+)\s*[\/\-]\s*([A-Za-z0-9]+)\s*$/', trim($text), $m)) {
+        if (preg_match('/^\s*([A-Za-z0-9-]+)\s*[\/]\s*([A-Za-z0-9-]+)\s*$/', trim($text), $m)) {
             return $this->str->strOrNull($m[2]);
         }
 
